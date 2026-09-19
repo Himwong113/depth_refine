@@ -17,9 +17,8 @@ from torch.utils.data import DataLoader, Dataset
 class ZJUL5Dataset(Dataset[dict[str, Any]]):
     """Load paired RGB, 8x8 ToF depth, and 480x640 target depth.
 
-    The official root ``data.json`` manifest is used instead of globbing files.
-    This intentionally excludes legacy samples whose HDF5 schema differs from
-    the train/test samples.
+    The root ``data.json`` manifest is used instead of globbing files so train,
+    validation, and test membership remains explicit and reproducible.
 
     Returned sample keys:
         ``image``: normalized ``float32`` tensor shaped ``(3, 480, 640)``.
@@ -168,6 +167,25 @@ def _seed_worker(worker_id: int) -> None:
     random.seed(worker_seed)
 
 
+def get_zjul5_manifest_splits(config: dict[str, Any]) -> tuple[str, ...]:
+    """Return the explicitly defined splits in the configured manifest."""
+
+    root = Path(config["root"]).expanduser().resolve()
+    if not root.is_dir():
+        raise FileNotFoundError(f"ZJU-L5 root directory not found: {root}")
+    manifest_path = Path(config.get("manifest", "data.json")).expanduser()
+    if not manifest_path.is_absolute():
+        manifest_path = root / manifest_path
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"ZJU-L5 manifest not found: {manifest_path}")
+
+    with manifest_path.open("r", encoding="utf-8") as manifest_file:
+        manifest_data = json.load(manifest_file)
+    if not isinstance(manifest_data, dict):
+        raise ValueError("ZJU-L5 manifest root must be a mapping")
+    return tuple(manifest_data)
+
+
 def build_zjul5_dataloader(config: dict[str, Any]) -> DataLoader[dict[str, Any]]:
     """Construct a ZJU-L5 DataLoader from the ``data`` YAML section."""
 
@@ -202,4 +220,3 @@ def build_zjul5_dataloader(config: dict[str, Any]) -> DataLoader[dict[str, Any]]
         worker_init_fn=_seed_worker if num_workers > 0 else None,
         generator=generator,
     )
-

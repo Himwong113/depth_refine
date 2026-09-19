@@ -44,12 +44,14 @@ class _TensorBoardSampleLogger:
         writer: SummaryWriter,
         epoch: int,
         max_images: int,
+        split_name: str,
         data_config: dict[str, Any],
         tensorboard_config: dict[str, Any],
     ) -> None:
         self.writer = writer
         self.epoch = epoch
         self.max_images = max_images
+        self.split_name = split_name
         self.logged_images = 0
         self.normalize_image = bool(data_config.get("normalize_image", True))
         self.image_mean = data_config.get("image_mean", (0.485, 0.456, 0.406))
@@ -80,7 +82,7 @@ class _TensorBoardSampleLogger:
                 depth_max=self.depth_max,
             )
             self.writer.add_figure(
-                f"Samples/validation_{self.logged_images + 1}",
+                f"Samples/{self.split_name}_{self.logged_images + 1}",
                 figure,
                 global_step=self.epoch,
                 close=True,
@@ -388,6 +390,14 @@ def train_model(
         raise ValueError("training.tensorboard.num_images must be positive")
     if data_config is None:
         data_config = {}
+    validation_split = config.get("validation_split", "val")
+    validation_split_name = str(validation_split) if validation_split else "none"
+    validation_uses_test_fallback = bool(
+        config.get("validation_uses_test_fallback", False)
+    )
+    tensorboard_validation_name = (
+        "test_fallback" if validation_uses_test_fallback else validation_split_name
+    )
 
     checkpoint_dir = Path(config.get("checkpoint_dir", "checkpoints")).expanduser()
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -438,11 +448,38 @@ def train_model(
             log_dir=str(tensorboard_dir),
             purge_step=start_epoch if resume_from else None,
         )
+        writer.add_text(
+            "Workflow/data_splits",
+            (
+                "train=train, validation="
+                f"{tensorboard_validation_name}, final_evaluation=test"
+            ),
+            global_step=start_epoch - 1,
+        )
+        writer.add_custom_scalars(
+            {
+                "Workflow": {
+                    "Train vs validation loss": [
+                        "Multiline",
+                        ["Loss/train", "Loss/validation"],
+                    ],
+                    "Overfitting gap": [
+                        "Multiline",
+                        ["Overfitting/validation_minus_train_loss"],
+                    ],
+                }
+            }
+        )
 
     print(f"\nTraining device: {device}")
     print(f"Mixed precision: {use_amp}")
     print(f"Loss: {loss_name}")
     print(f"LR scheduler: {config.get('lr_scheduler', 'cosine')}")
+    print(f"Training split: train")
+    if validation_loader is not None:
+        print(f"Validation split: {tensorboard_validation_name}")
+    else:
+        print("Validation split: disabled")
     if writer is not None:
         print(f"TensorBoard log: {Path(writer.log_dir).resolve()}")
 
@@ -516,6 +553,7 @@ def train_model(
                     writer,
                     epoch,
                     tensorboard_num_images,
+                    tensorboard_validation_name,
                     data_config,
                     tensorboard_config,
                 )
@@ -528,9 +566,9 @@ def train_model(
                 loss_config=config,
             )
             message += (
-                f" · val loss {validation_metrics['loss']:.6f} "
-                f"· val MAE {validation_metrics['mae']:.6f} "
-                f"· val RMSE {validation_metrics['rmse']:.6f}"
+                f" · {validation_split_name} loss {validation_metrics['loss']:.6f} "
+                f"· {validation_split_name} MAE {validation_metrics['mae']:.6f} "
+                f"· {validation_split_name} RMSE {validation_metrics['rmse']:.6f}"
             )
         print(message)
 
@@ -545,6 +583,17 @@ def train_model(
                 writer.add_scalar(
                     "Metrics/validation_RMSE", validation_metrics["rmse"], epoch
                 )
+                writer.add_scalar(
+                    "Overfitting/validation_minus_train_loss",
+                    validation_metrics["loss"] - mean_loss,
+                    epoch,
+                )
+                if mean_loss > 0:
+                    writer.add_scalar(
+                        "Overfitting/validation_to_train_loss_ratio",
+                        validation_metrics["loss"] / mean_loss,
+                        epoch,
+                    )
             writer.flush()
 
         if scheduler is not None:

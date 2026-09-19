@@ -78,7 +78,9 @@ training:
   amp: true
   log_every: 10
 
-  validation_split: test
+  # Used for overfitting checks and best.pt selection. If a legacy manifest has
+  # no val split, train.py warns and falls back to test.
+  validation_split: val
   validation_every: 1
 
   tensorboard:

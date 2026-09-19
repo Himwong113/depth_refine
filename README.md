@@ -37,6 +37,24 @@ levels. `Adec` uses the same two inputs but independent Q/K projection weights,
 and is shared only by decoder concatenations. Every encoder level and decoder
 concatenation has an independent value projection.
 
+### Publication-style architecture figure
+
+![DepthRefinementUNet architecture](docs/depth_refinement_architecture.png)
+
+The diagram is available as an editable
+[SVG](docs/depth_refinement_architecture.svg) and a high-resolution
+[PNG](docs/depth_refinement_architecture.png). Regenerate both from the current
+architecture drawing source with:
+
+```bash
+source .venv/bin/activate
+python draw_architecture.py
+```
+
+The solid paths show feature flow, dashed purple/orange paths show attention
+matrices shared within the encoder or decoder, and yellow modules identify the
+independent value projections.
+
 ```mermaid
 flowchart TB
     RGB["RGB image<br/>B × 3 × H × W"]
@@ -225,6 +243,21 @@ reports the first batch. Each batch contains:
 - `target_valid_mask`: validity of high-resolution depth pixels.
 - `path`: source HDF5 path relative to the dataset root.
 
+The manifest uses a scene-level 70/10/20 split across all 1,010 schema-compatible
+HDF5 samples, so nearby frames from one scene cannot leak between training and
+evaluation:
+
+| Split | Samples | Scenes |
+| --- | ---: | --- |
+| Train | 707 | cafe1, cafe2, classroom, dinner_room1, lab1, lab2, leisure_area, library1, supermarket, teaching_region |
+| Validation | 101 | library2 |
+| Test | 202 | dinner_room2, dorm, showroom, theater |
+
+Training shuffles and consumes the full `train` split each epoch. Validation
+uses the complete `val` split, while `eval.py` defaults to the `test` split.
+Eleven legacy files are deliberately excluded because they contain `tof`
+instead of the `hist_data` and `mask` datasets required by this input pipeline.
+
 Inspect a batch with:
 
 ```bash
@@ -235,6 +268,24 @@ python main.py
 
 Training is handled by `train.py`. `main.py` only validates the configuration,
 constructs the model, and inspects one dataset batch.
+
+### Train/validation/test workflow
+
+The three splits have separate roles:
+
+1. `train` updates model weights. `train.py` always uses this split and shuffles
+   it, regardless of the inspection value in `data.split`.
+2. `val` never updates weights. It measures generalization, provides the
+   TensorBoard validation curves and samples, and selects `best.pt` using the
+   lowest validation RMSE.
+3. `test` is not read during normal training. After training decisions are
+   complete, run `eval.py` once on `best.pt` for the final performance estimate.
+
+For compatibility with an older `data.json` containing only `train` and `test`,
+`train.py` emits a warning and uses `test` as the validation fallback. In that
+case, test data influences model selection, so its result is no longer an
+unbiased final performance estimate. The current manifest has a dedicated
+`val` split and does not use this fallback.
 
 Before starting, check these sections in [`config.yml`](config.yml):
 
@@ -265,7 +316,7 @@ training:
   scale_invariant_alpha: 10.0
   minimum_depth: 0.001
   amp: true                # used on CUDA only
-  validation_split: test
+  validation_split: val
   tensorboard:
     enabled: true
     log_dir: runs/depth_refinement
@@ -293,7 +344,11 @@ TensorBoard logging is enabled by default. Event files are written to
 - `Loss/validation`: mean validation loss using the configured loss function.
 - `Metrics/validation_MAE` and `Metrics/validation_RMSE` in meters.
 - `Learning_rate/epoch`: the learning rate used during that epoch.
-- `Samples/validation_*`: RGB, sparse depth, refined depth, and ground-truth
+- `Overfitting/validation_minus_train_loss`: the validation–training loss gap.
+- `Overfitting/validation_to_train_loss_ratio`: the validation/training ratio.
+- `Workflow/data_splits`: records the actual split selection, including whether
+  the legacy `test_fallback` was activated.
+- `Samples/val_*`: RGB, sparse depth, refined depth, and ground-truth
   panels generated with the same renderer as `eval.py`.
 
 Start the TensorBoard web interface in another terminal while training runs:
@@ -308,6 +363,12 @@ and `num_images` controls how many validation samples are written each time.
 When `depth_max` is `null`, each panel uses the 99th percentile of its valid
 ground truth as the upper color limit. Set `training.tensorboard.enabled` to
 `false` to disable event logging. The `runs/` directory is ignored by Git.
+
+Use the TensorBoard **Train vs validation loss** chart to monitor overfitting.
+A validation loss that stops improving while training loss continues downward,
+especially with a growing positive gap or ratio, is evidence of overfitting.
+Use `best.pt` from the lowest validation RMSE rather than the final epoch when
+this occurs.
 
 The default loss follows DELTAR Equation 4: a scaled scale-invariant loss over
 the logarithmic difference between predicted and target depth. It uses
