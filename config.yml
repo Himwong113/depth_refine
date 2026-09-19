@@ -1,0 +1,93 @@
+# DepthRefinementUNet configuration
+model:
+  image_channels: 3
+
+  # Encoder widths become base, 2×base, 4×base, and 8×base.
+  # For a faster iPhone 12 model, set both channel values to 16.
+  base_channels: 32
+  attention_channels: 32
+
+  # Maximum flattened spatial embedding E used to create the shared QK^T.
+  max_attention_tokens: 1024
+  attention_dropout: 0.0
+
+  # Predict a correction on top of the interpolated sparse depth.
+  residual_output: true
+  # Required by the logarithmic scale-invariant training loss.
+  positive_output: true
+  depth_interpolation: bilinear
+
+summary:
+  # Controls the dtype used when calculating parameter/model memory.
+  # Supported values: float32, float16, bfloat16.
+  parameter_dtype: float32
+  show_architecture: false
+
+data:
+  root: /home/himwong/Downloads/ZJUL5/ZJUL5
+  manifest: data.json
+  split: train
+
+  batch_size: 1
+  shuffle: true
+  num_workers: 0
+  pin_memory: false
+  drop_last: false
+  seed: 42
+
+  # Match the normalization used by common RGB depth models.
+  normalize_image: true
+  image_mean: [0.485, 0.456, 0.406]
+  image_std: [0.229, 0.224, 0.225]
+
+  # Use null to retain all positive ground-truth depths.
+  max_depth: null
+
+  # main.py reads and reports one batch when enabled.
+  inspect_first_batch: true
+
+training:
+  device: auto
+  epochs: 60
+  resume_from: null
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+
+  # DELTAR Eq. 4. Other supported options: smooth_l1, l1, mse.
+  loss: scale_invariant
+  scale_invariant_lambda: 0.85
+  scale_invariant_alpha: 10.0
+  minimum_depth: 0.001
+
+  # Used only when loss is smooth_l1.
+  smooth_l1_beta: 0.1
+  gradient_clip_norm: 1.0
+
+  # CUDA mixed precision is enabled automatically when CUDA is selected.
+  amp: true
+  log_every: 10
+
+  validation_split: test
+  validation_every: 1
+
+  checkpoint_dir: checkpoints
+  save_every: 5
+
+  # Set either value to a small integer for a quick pipeline smoke test.
+  max_train_batches: null
+  max_validation_batches: null
+
+evaluation:
+  device: auto
+  split: test
+
+  # Set to an integer for a quick partial evaluation, or null for the full split.
+  max_batches: null
+
+  visualize: false
+  visualization_dir: evaluation_outputs
+  num_visualizations: 8
+  depth_min: 0.0
+
+  # null chooses the 99th percentile of valid GT depth independently per image.
+  depth_max: null

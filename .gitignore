@@ -1,0 +1,63 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Virtual environments and local environment variables
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+
+# Python build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Model weights and training checkpoints
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Exported deployment models
+*.onnx
+*.mlmodel
+*.mlpackage/
+
+# Training and evaluation outputs
+evaluation_outputs/
+runs/
+logs/
+wandb/
+lightning_logs/
+tensorboard/
+
+# Local datasets (the ZJU-L5 dataset is configured by absolute path)
+datasets/
+*.h5
+*.hdf5
+
+# Editors and operating-system files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+

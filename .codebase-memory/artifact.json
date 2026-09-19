@@ -1,0 +1,11 @@
+{
+    "schema_version": 2,
+    "commit": "",
+    "indexed_at": "2026-09-19T09:17:14Z",
+    "project": "depth_refine",
+    "nodes": 127,
+    "edges": 412,
+    "original_size": 2228224,
+    "compressed_size": 226821,
+    "compression_level": 3
+}

@@ -1,0 +1,6 @@
+torch>=2.3
+PyYAML>=6.0
+h5py>=3.10
+numpy>=1.24
+matplotlib>=3.7
+Pillow>=10
