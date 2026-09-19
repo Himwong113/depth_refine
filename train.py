@@ -27,7 +27,7 @@ def main() -> None:
     parser.add_argument(
         "--resume",
         type=Path,
-        help="resume model, optimizer, scaler, and epoch from a checkpoint",
+        help="resume model, optimizer, scheduler, scaler, and epoch from a checkpoint",
     )
     parser.add_argument(
         "--epochs",
@@ -74,6 +74,7 @@ def main() -> None:
         train_loader,
         validation_loader,
         training_options,
+        config["data"],
     )
 
 

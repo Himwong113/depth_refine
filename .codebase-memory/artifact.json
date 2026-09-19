@@ -1,11 +1,11 @@
 {
     "schema_version": 2,
-    "commit": "",
-    "indexed_at": "2026-09-19T09:17:14Z",
+    "commit": "3396e37566b62e9bfc5d1bc257fb41056405875a",
+    "indexed_at": "2026-09-19T09:52:20Z",
     "project": "depth_refine",
-    "nodes": 127,
-    "edges": 412,
-    "original_size": 2228224,
-    "compressed_size": 226821,
+    "nodes": 132,
+    "edges": 429,
+    "original_size": 1900544,
+    "compressed_size": 51181,
     "compression_level": 3
 }

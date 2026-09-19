@@ -1,10 +1,10 @@
 """Depth refinement network.
 
 The model accepts an RGB image and a (possibly lower-resolution) sparse depth
-map.  One channel-attention matrix is computed from image queries and depth
-keys.  That same matrix is shared by all U-Net encoder stages; each stage has
-its own value projection.  A U-Net decoder then converts the attended features
-into a dense, one-channel depth prediction.
+map.  Independent encoder and decoder channel-attention matrices are computed
+from image queries and interpolated-depth keys. The encoder matrix is shared by
+all encoder stages and the decoder matrix is shared by all decoder skip
+concatenations. Every location has its own value projection.
 
 Tensor shapes
 -------------
@@ -74,20 +74,49 @@ class DownBlock(nn.Module):
 
 
 class UpBlock(nn.Module):
-    """Upsample, concatenate the matching skip, and refine the result."""
+    """Attend and refine an upsampled decoder/encoder skip concatenation."""
 
-    def __init__(self, in_channels: int, skip_channels: int, out_channels: int) -> None:
+    def __init__(
+        self,
+        in_channels: int,
+        skip_channels: int,
+        out_channels: int,
+        attention_channels: int | None = None,
+        attention_dropout: float = 0.0,
+    ) -> None:
         super().__init__()
-        self.conv = DoubleConv(in_channels + skip_channels, out_channels)
+        concatenated_channels = in_channels + skip_channels
+        self.attention_fusion = (
+            AttentionValueFusion(
+                concatenated_channels,
+                attention_channels,
+                attention_dropout,
+            )
+            if attention_channels is not None
+            else None
+        )
+        self.conv = DoubleConv(concatenated_channels, out_channels)
 
-    def forward(self, x: Tensor, skip: Tensor) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        skip: Tensor,
+        shared_attention: Tensor | None = None,
+    ) -> Tensor:
         # An explicit target size also handles odd input heights and widths.
         x = F.interpolate(x, size=skip.shape[-2:], mode="bilinear", align_corners=False)
-        return self.conv(torch.cat((x, skip), dim=1))
+        concatenated = torch.cat((x, skip), dim=1)
+        if self.attention_fusion is not None:
+            if shared_attention is None:
+                raise ValueError(
+                    "shared_attention is required when decoder attention is enabled"
+                )
+            concatenated = self.attention_fusion(concatenated, shared_attention)
+        return self.conv(concatenated)
 
 
 class SharedQKAttention(nn.Module):
-    """Compute the single channel-attention matrix shared by the U-Net.
+    """Compute one RGB/depth channel-attention matrix.
 
     The image branch produces ``Q`` and the resized-depth branch produces
     ``K``.  After flattening the spatial embedding dimension ``E``, their
@@ -156,10 +185,10 @@ class SharedQKAttention(nn.Module):
 
 
 class AttentionValueFusion(nn.Module):
-    """Apply shared ``QK^T`` attention to one encoder stage's private value.
+    """Apply shared ``QK^T`` attention to one feature tensor's private value.
 
-    Every instance owns a separate value projection, so encoder stage ``i``
-    computes ``V_i`` independently while reusing the same attention matrix.
+    Every instance owns a separate value projection, so encoder and decoder
+    locations compute ``V_i`` independently while reusing one attention matrix.
     """
 
     def __init__(
@@ -200,7 +229,7 @@ class AttentionValueFusion(nn.Module):
 
 
 class DepthRefinementUNet(nn.Module):
-    """U-Net whose encoder stages reuse one RGB/depth attention matrix.
+    """U-Net with separate shared attention matrices for encoder and decoder.
 
     Args:
         image_channels: Number of image channels, normally three.
@@ -209,6 +238,9 @@ class DepthRefinementUNet(nn.Module):
             to ``base_channels``.
         max_attention_tokens: Maximum spatial embedding size ``E`` used for Q/K.
         attention_dropout: Dropout probability for attention and attended values.
+        decoder_attention: Compute a second RGB/interpolated-depth ``QK^T``
+            matrix with independent weights and apply it to decoder/encoder skip
+            concatenations through independent value paths.
         residual_output: Add resized sparse depth to the predicted correction.
         positive_output: Apply ``softplus`` to the final prediction.
         depth_interpolation: Interpolation mode used to resize sparse depth.
@@ -221,6 +253,7 @@ class DepthRefinementUNet(nn.Module):
         attention_channels: int | None = None,
         max_attention_tokens: int = 1024,
         attention_dropout: float = 0.0,
+        decoder_attention: bool = True,
         residual_output: bool = True,
         positive_output: bool = False,
         depth_interpolation: str = "bilinear",
@@ -262,9 +295,38 @@ class DepthRefinementUNet(nn.Module):
         self.fuse3 = AttentionValueFusion(widths[2], attention_channels, attention_dropout)
         self.fuse4 = AttentionValueFusion(widths[3], attention_channels, attention_dropout)
 
-        self.up3 = UpBlock(widths[3], widths[2], widths[2])
-        self.up2 = UpBlock(widths[2], widths[1], widths[1])
-        self.up1 = UpBlock(widths[1], widths[0], widths[0])
+        decoder_attention_channels = attention_channels if decoder_attention else None
+        self.decoder_shared_qk = (
+            SharedQKAttention(
+                image_channels=image_channels,
+                attention_channels=attention_channels,
+                max_tokens=max_attention_tokens,
+                dropout=attention_dropout,
+            )
+            if decoder_attention
+            else None
+        )
+        self.up3 = UpBlock(
+            widths[3],
+            widths[2],
+            widths[2],
+            decoder_attention_channels,
+            attention_dropout,
+        )
+        self.up2 = UpBlock(
+            widths[2],
+            widths[1],
+            widths[1],
+            decoder_attention_channels,
+            attention_dropout,
+        )
+        self.up1 = UpBlock(
+            widths[1],
+            widths[0],
+            widths[0],
+            decoder_attention_channels,
+            attention_dropout,
+        )
         self.output_head = nn.Conv2d(widths[0], 1, kernel_size=1)
 
     def _resize_depth(self, depth: Tensor, size: Tuple[int, int]) -> Tensor:
@@ -312,9 +374,14 @@ class DepthRefinementUNet(nn.Module):
         image3 = self.fuse3(self.image_down2(image2), shared_attention)
         image4 = self.fuse4(self.image_down3(image3), shared_attention)
 
-        decoded = self.up3(image4, image3)
-        decoded = self.up2(decoded, image2)
-        decoded = self.up1(decoded, image1)
+        decoder_attention = (
+            self.decoder_shared_qk(image, resized_depth)
+            if self.decoder_shared_qk is not None
+            else None
+        )
+        decoded = self.up3(image4, image3, decoder_attention)
+        decoded = self.up2(decoded, image2, decoder_attention)
+        decoded = self.up1(decoded, image1, decoder_attention)
         prediction = self.output_head(decoded)
 
         if self.residual_output:

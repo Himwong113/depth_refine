@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import warnings
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
-from collections.abc import Callable
 
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
+
+from visualization import create_depth_comparison_figure
 
 
 def resolve_device(requested_device: str) -> torch.device:
@@ -30,6 +34,58 @@ def resolve_device(requested_device: str) -> torch.device:
     ):
         raise RuntimeError("training.device requests MPS, but MPS is unavailable")
     return device
+
+
+class _TensorBoardSampleLogger:
+    """Write eval-style inference comparison figures to TensorBoard."""
+
+    def __init__(
+        self,
+        writer: SummaryWriter,
+        epoch: int,
+        max_images: int,
+        data_config: dict[str, Any],
+        tensorboard_config: dict[str, Any],
+    ) -> None:
+        self.writer = writer
+        self.epoch = epoch
+        self.max_images = max_images
+        self.logged_images = 0
+        self.normalize_image = bool(data_config.get("normalize_image", True))
+        self.image_mean = data_config.get("image_mean", (0.485, 0.456, 0.406))
+        self.image_std = data_config.get("image_std", (0.229, 0.224, 0.225))
+        self.depth_min = float(tensorboard_config.get("depth_min", 0.0))
+        self.depth_max = tensorboard_config.get("depth_max")
+        if self.depth_max is not None:
+            self.depth_max = float(self.depth_max)
+
+    def __call__(
+        self,
+        batch: dict[str, Any],
+        prediction: Tensor,
+        batch_index: int,
+    ) -> None:
+        del batch_index
+        for sample_index in range(prediction.shape[0]):
+            if self.logged_images >= self.max_images:
+                return
+            figure = create_depth_comparison_figure(
+                batch,
+                prediction,
+                sample_index=sample_index,
+                normalize_image=self.normalize_image,
+                image_mean=self.image_mean,
+                image_std=self.image_std,
+                depth_min=self.depth_min,
+                depth_max=self.depth_max,
+            )
+            self.writer.add_figure(
+                f"Samples/validation_{self.logged_images + 1}",
+                figure,
+                global_step=self.epoch,
+                close=True,
+            )
+            self.logged_images += 1
 
 
 def masked_depth_loss(
@@ -96,13 +152,16 @@ def evaluate(
     device: torch.device,
     max_batches: int | None = None,
     prediction_callback: Callable[[dict[str, Any], Tensor, int], None] | None = None,
+    loss_config: dict[str, Any] | None = None,
 ) -> dict[str, float]:
-    """Evaluate masked MAE and RMSE on a DataLoader."""
+    """Evaluate masked loss, MAE, and RMSE on a DataLoader."""
 
     model.eval()
     absolute_error_sum = 0.0
     squared_error_sum = 0.0
     valid_pixel_count = 0
+    loss_sum = 0.0
+    completed_batches = 0
 
     with torch.inference_mode():
         for batch_index, batch in enumerate(data_loader):
@@ -116,6 +175,18 @@ def evaluate(
             prediction = model(image, sparse_depth)
             if prediction_callback is not None:
                 prediction_callback(batch, prediction, batch_index)
+            if loss_config is not None:
+                loss_sum += masked_depth_loss(
+                    prediction,
+                    target,
+                    valid_mask,
+                    str(loss_config.get("loss", "scale_invariant")),
+                    float(loss_config.get("smooth_l1_beta", 0.1)),
+                    float(loss_config.get("scale_invariant_lambda", 0.85)),
+                    float(loss_config.get("scale_invariant_alpha", 10.0)),
+                    float(loss_config.get("minimum_depth", 1e-3)),
+                ).item()
+            completed_batches += 1
             valid_mask &= torch.isfinite(prediction) & torch.isfinite(target)
             error = prediction[valid_mask] - target[valid_mask]
             absolute_error_sum += error.abs().sum().item()
@@ -124,10 +195,13 @@ def evaluate(
 
     if valid_pixel_count == 0:
         raise RuntimeError("validation produced no valid target-depth pixels")
-    return {
+    metrics = {
         "mae": absolute_error_sum / valid_pixel_count,
         "rmse": (squared_error_sum / valid_pixel_count) ** 0.5,
     }
+    if loss_config is not None:
+        metrics["loss"] = loss_sum / completed_batches
+    return metrics
 
 
 def _save_checkpoint(checkpoint_path: Path, state: dict[str, Any]) -> None:
@@ -138,10 +212,65 @@ def _save_checkpoint(checkpoint_path: Path, state: dict[str, Any]) -> None:
     temporary_path.replace(checkpoint_path)
 
 
+def _build_lr_scheduler(
+    optimizer: torch.optim.Optimizer,
+    config: dict[str, Any],
+    epochs: int,
+) -> torch.optim.lr_scheduler.LRScheduler | None:
+    """Build the configured epoch-level learning-rate scheduler."""
+
+    scheduler_name = str(config.get("lr_scheduler", "cosine")).lower()
+    if scheduler_name in {"none", "constant"}:
+        return None
+    if scheduler_name != "cosine":
+        raise ValueError("training.lr_scheduler must be one of: cosine, constant, none")
+
+    warmup_epochs = int(config.get("warmup_epochs", 0))
+    if not 0 <= warmup_epochs < epochs:
+        raise ValueError(
+            "training.warmup_epochs must be non-negative and smaller than "
+            "training.epochs"
+        )
+
+    minimum_learning_rate = float(config.get("minimum_learning_rate", 1e-6))
+    learning_rate = float(config.get("learning_rate", 3e-4))
+    if not 0.0 <= minimum_learning_rate <= learning_rate:
+        raise ValueError(
+            "training.minimum_learning_rate must be between zero and "
+            "training.learning_rate"
+        )
+
+    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=epochs - warmup_epochs,
+        eta_min=minimum_learning_rate,
+    )
+    if warmup_epochs == 0:
+        return cosine
+
+    warmup_start_factor = float(config.get("warmup_start_factor", 0.1))
+    if not 0.0 < warmup_start_factor <= 1.0:
+        raise ValueError(
+            "training.warmup_start_factor must be greater than zero and at most one"
+        )
+    warmup = torch.optim.lr_scheduler.LinearLR(
+        optimizer,
+        start_factor=warmup_start_factor,
+        end_factor=1.0,
+        total_iters=warmup_epochs,
+    )
+    return torch.optim.lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers=[warmup, cosine],
+        milestones=[warmup_epochs],
+    )
+
+
 def _checkpoint_state(
     epoch: int,
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler | None,
     scaler: torch.amp.GradScaler,
     config: dict[str, Any],
     best_validation_rmse: float,
@@ -151,6 +280,7 @@ def _checkpoint_state(
         "epoch": epoch,
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
         "scaler_state_dict": scaler.state_dict(),
         "training_config": config,
         "best_validation_rmse": best_validation_rmse,
@@ -162,6 +292,7 @@ def _load_resume_checkpoint(
     checkpoint_path: Path,
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler | None,
     scaler: torch.amp.GradScaler,
     device: torch.device,
 ) -> tuple[int, float, int | None]:
@@ -176,12 +307,31 @@ def _load_resume_checkpoint(
         missing = ", ".join(sorted(missing_keys))
         raise ValueError(f"resume checkpoint is missing: {missing}")
 
+    initial_scheduler_lrs = [group["lr"] for group in optimizer.param_groups]
     model.load_state_dict(checkpoint["model_state_dict"], strict=True)
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     if "scaler_state_dict" in checkpoint:
         scaler.load_state_dict(checkpoint["scaler_state_dict"])
 
     completed_epoch = int(checkpoint["epoch"])
+    scheduler_state = checkpoint.get("scheduler_state_dict")
+    if scheduler is not None and scheduler_state is not None:
+        scheduler.load_state_dict(scheduler_state)
+    elif scheduler is not None:
+        # Older checkpoints have no scheduler state. Reconstruct the learning
+        # rate at the next epoch instead of restarting the schedule.
+        for parameter_group, initial_lr in zip(
+            optimizer.param_groups, initial_scheduler_lrs, strict=True
+        ):
+            parameter_group["lr"] = initial_lr
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=r"Detected call of `lr_scheduler.step\(\)` before",
+            )
+            for _ in range(completed_epoch):
+                scheduler.step()
+
     best_validation_rmse = float(checkpoint.get("best_validation_rmse", float("inf")))
     best_epoch_value = checkpoint.get("best_epoch")
     best_epoch = int(best_epoch_value) if best_epoch_value is not None else None
@@ -193,6 +343,7 @@ def train_model(
     train_loader: DataLoader,
     validation_loader: DataLoader | None,
     config: dict[str, Any],
+    data_config: dict[str, Any] | None = None,
 ) -> None:
     """Train the model and periodically save resumable checkpoints."""
 
@@ -207,6 +358,7 @@ def train_model(
         lr=float(config.get("learning_rate", 3e-4)),
         weight_decay=float(config.get("weight_decay", 1e-4)),
     )
+    scheduler = _build_lr_scheduler(optimizer, config, epochs)
 
     use_amp = bool(config.get("amp", True)) and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
@@ -226,6 +378,17 @@ def train_model(
     if max_validation_batches is not None:
         max_validation_batches = int(max_validation_batches)
 
+    tensorboard_config = dict(config.get("tensorboard", {}))
+    tensorboard_enabled = bool(tensorboard_config.get("enabled", True))
+    tensorboard_image_every = int(tensorboard_config.get("image_every", 1))
+    tensorboard_num_images = int(tensorboard_config.get("num_images", 2))
+    if tensorboard_image_every <= 0:
+        raise ValueError("training.tensorboard.image_every must be positive")
+    if tensorboard_num_images <= 0:
+        raise ValueError("training.tensorboard.num_images must be positive")
+    if data_config is None:
+        data_config = {}
+
     checkpoint_dir = Path(config.get("checkpoint_dir", "checkpoints")).expanduser()
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
@@ -241,6 +404,7 @@ def train_model(
             resume_path,
             model,
             optimizer,
+            scheduler,
             scaler,
             device,
         )
@@ -265,12 +429,26 @@ def train_model(
             f"training.epochs is {epochs}; increase the total epoch count"
         )
 
+    writer = None
+    if tensorboard_enabled:
+        tensorboard_dir = Path(
+            tensorboard_config.get("log_dir", "runs/depth_refinement")
+        ).expanduser()
+        writer = SummaryWriter(
+            log_dir=str(tensorboard_dir),
+            purge_step=start_epoch if resume_from else None,
+        )
+
     print(f"\nTraining device: {device}")
     print(f"Mixed precision: {use_amp}")
     print(f"Loss: {loss_name}")
+    print(f"LR scheduler: {config.get('lr_scheduler', 'cosine')}")
+    if writer is not None:
+        print(f"TensorBoard log: {Path(writer.log_dir).resolve()}")
 
     for epoch in range(start_epoch, epochs + 1):
         model.train()
+        current_learning_rate = optimizer.param_groups[0]["lr"]
         epoch_loss = 0.0
         completed_batches = 0
 
@@ -321,7 +499,10 @@ def train_model(
         if completed_batches == 0:
             raise RuntimeError("training completed no batches")
         mean_loss = epoch_loss / completed_batches
-        message = f"Epoch {epoch}/{epochs} complete · train loss {mean_loss:.6f}"
+        message = (
+            f"Epoch {epoch}/{epochs} complete · train loss {mean_loss:.6f} "
+            f"· lr {current_learning_rate:.3e}"
+        )
 
         validation_metrics = None
         if (
@@ -329,17 +510,45 @@ def train_model(
             and validation_every > 0
             and epoch % validation_every == 0
         ):
+            prediction_callback = None
+            if writer is not None and epoch % tensorboard_image_every == 0:
+                prediction_callback = _TensorBoardSampleLogger(
+                    writer,
+                    epoch,
+                    tensorboard_num_images,
+                    data_config,
+                    tensorboard_config,
+                )
             validation_metrics = evaluate(
                 model,
                 validation_loader,
                 device,
                 max_batches=max_validation_batches,
+                prediction_callback=prediction_callback,
+                loss_config=config,
             )
             message += (
-                f" · val MAE {validation_metrics['mae']:.6f} "
+                f" · val loss {validation_metrics['loss']:.6f} "
+                f"· val MAE {validation_metrics['mae']:.6f} "
                 f"· val RMSE {validation_metrics['rmse']:.6f}"
             )
         print(message)
+
+        if writer is not None:
+            writer.add_scalar("Loss/train", mean_loss, epoch)
+            writer.add_scalar("Learning_rate/epoch", current_learning_rate, epoch)
+            if validation_metrics is not None:
+                writer.add_scalar("Loss/validation", validation_metrics["loss"], epoch)
+                writer.add_scalar(
+                    "Metrics/validation_MAE", validation_metrics["mae"], epoch
+                )
+                writer.add_scalar(
+                    "Metrics/validation_RMSE", validation_metrics["rmse"], epoch
+                )
+            writer.flush()
+
+        if scheduler is not None:
+            scheduler.step()
 
         if (
             validation_metrics is not None
@@ -354,6 +563,7 @@ def train_model(
                     epoch,
                     model,
                     optimizer,
+                    scheduler,
                     scaler,
                     config,
                     best_validation_rmse,
@@ -376,6 +586,7 @@ def train_model(
                     epoch,
                     model,
                     optimizer,
+                    scheduler,
                     scaler,
                     config,
                     best_validation_rmse,
@@ -383,3 +594,6 @@ def train_model(
                 ),
             )
             print(f"Saved checkpoint: {checkpoint_path.resolve()}")
+
+    if writer is not None:
+        writer.close()

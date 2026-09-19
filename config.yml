@@ -11,6 +11,10 @@ model:
   max_attention_tokens: 1024
   attention_dropout: 0.0
 
+  # Build a second QK^T from RGB and interpolated depth using independent
+  # decoder Q/K weights, then share it across decoder concatenations.
+  decoder_attention: true
+
   # Predict a correction on top of the interpolated sparse depth.
   residual_output: true
   # Required by the logarithmic scale-invariant training loss.
@@ -53,6 +57,13 @@ training:
   learning_rate: 0.0003
   weight_decay: 0.0001
 
+  # Linearly warm up, then decay the learning rate with a cosine curve.
+  # Set lr_scheduler to none or constant to keep a fixed learning rate.
+  lr_scheduler: cosine
+  warmup_epochs: 3
+  warmup_start_factor: 0.1
+  minimum_learning_rate: 0.000001
+
   # DELTAR Eq. 4. Other supported options: smooth_l1, l1, mse.
   loss: scale_invariant
   scale_invariant_lambda: 0.85
@@ -69,6 +80,16 @@ training:
 
   validation_split: test
   validation_every: 1
+
+  tensorboard:
+    enabled: true
+    log_dir: runs/depth_refinement
+    # Log eval-style RGB | sparse | refined | GT panels every N epochs.
+    image_every: 1
+    num_images: 2
+    depth_min: 0.0
+    # null uses the valid GT 99th percentile independently for each sample.
+    depth_max: null
 
   checkpoint_dir: checkpoints
   save_every: 5
