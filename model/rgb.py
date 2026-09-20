@@ -10,7 +10,84 @@ import torch.nn.functional as F
 
 from .blocks import ConvNormAct, DepthwiseSeparableBlock
 
-__all__ = ["FrozenDepthAnythingPyramid", "MobileRGBEncoder"]
+__all__ = [
+    "EfficientFormerV2RGBEncoder",
+    "FrozenDepthAnythingPyramid",
+    "MobileRGBEncoder",
+]
+
+
+class EfficientFormerV2RGBEncoder(nn.Module):
+    """Scratch-initialized EfficientFormerV2-S0 feature pyramid.
+
+    The official S0 attention path requires stage sizes that remain even across
+    its internal stride-two attention.  The default 256x320 working resolution
+    satisfies that constraint and keeps the deployment graph fixed.
+    """
+
+    output_channels = (32, 48, 96, 176)
+    output_reductions = (4, 8, 16, 32)
+
+    def __init__(
+        self,
+        image_channels: int = 3,
+        model_name: str = "efficientformerv2_s0",
+        input_size: tuple[int, int] | list[int] = (256, 320),
+        pretrained: bool = False,
+    ) -> None:
+        super().__init__()
+        if image_channels != 3:
+            raise ValueError("EfficientFormerV2-S0 requires three-channel RGB input")
+        if model_name != "efficientformerv2_s0":
+            raise ValueError("student_v5 currently supports efficientformerv2_s0 only")
+        if pretrained:
+            raise ValueError(
+                "student_v5 is intentionally scratch initialized; "
+                "encoder_pretrained must be false"
+            )
+        if len(input_size) != 2:
+            raise ValueError("encoder_input_size must contain height and width")
+        self.input_size = tuple(int(value) for value in input_size)
+        if min(self.input_size) < 32 or any(value % 32 for value in self.input_size):
+            raise ValueError(
+                "encoder_input_size dimensions must be at least 32 and divisible by 32"
+            )
+        try:
+            import timm
+        except ImportError as exc:  # pragma: no cover - dependency error
+            raise ImportError(
+                "student_v5 requires timm==1.0.29; install requirements.txt"
+            ) from exc
+
+        self.model_name = model_name
+        self.pretrained = False
+        self.backbone = timm.create_model(
+            model_name,
+            pretrained=False,
+            features_only=True,
+            img_size=self.input_size,
+        )
+        channels = tuple(int(value) for value in self.backbone.feature_info.channels())
+        reductions = tuple(
+            int(value) for value in self.backbone.feature_info.reduction()
+        )
+        if channels != self.output_channels or reductions != self.output_reductions:
+            raise RuntimeError(
+                "unexpected EfficientFormerV2-S0 feature contract: "
+                f"channels={channels}, reductions={reductions}"
+            )
+
+    def forward(self, image: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        working = F.interpolate(
+            image,
+            size=self.input_size,
+            mode="bilinear",
+            align_corners=False,
+        )
+        features = self.backbone(working)
+        if len(features) != 4:
+            raise RuntimeError("EfficientFormerV2-S0 must return four feature maps")
+        return tuple(features)  # type: ignore[return-value]
 
 
 class MobileRGBEncoder(nn.Module):

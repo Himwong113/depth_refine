@@ -1,0 +1,112 @@
+# Scratch EfficientFormerV2-S0 student distilled from the frozen v4 teacher.
+model:
+  architecture: student_v5
+  image_channels: 3
+  encoder_name: efficientformerv2_s0
+  encoder_input_size: [256, 320]
+  encoder_pretrained: false
+  decoder_channels: [32, 64, 96, 128]
+  detail_channels: 32
+  attention_dim: 32
+  attention_heads: 2
+  geometry_heads: 1
+  depth_scale: 10.0
+  positive_output: true
+  fallback_depth: 1.0
+  refine_channels: 8
+  fusion_scales: ["1_16", "1_8"]
+  use_appearance_pooling: true
+
+summary:
+  parameter_dtype: float16
+  show_architecture: false
+
+data:
+  root: /home/himwong/Downloads/ZJUL5/ZJUL5
+  manifest: data.json
+  split: train
+  batch_size: 1
+  shuffle: true
+  num_workers: 0
+  pin_memory: true
+  drop_last: false
+  seed: 42
+  normalize_image: true
+  image_mean: [0.485, 0.456, 0.406]
+  image_std: [0.229, 0.224, 0.225]
+  min_depth: 0.1
+  max_depth: 10.0
+  legacy_clamp_out_of_range: false
+  augment: true
+  horizontal_flip_probability: 0.5
+  photometric_probability: 0.5
+  inspect_first_batch: true
+
+training:
+  objective: student_distillation_v5
+  device: auto
+  epochs: 60
+  resume_from: null
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+  lr_scheduler: cosine
+  warmup_epochs: 3
+  warmup_start_factor: 0.1
+  minimum_learning_rate: 0.000001
+  loss: mse
+  gradient_clip_norm: 1.0
+  amp: true
+  log_every: 10
+  validation_split: val
+  validation_every: 1
+  checkpoint_dir: checkpoints_student_v5
+  save_every: 5
+  max_train_batches: null
+  max_validation_batches: null
+  distillation:
+    teacher_checkpoint: checkpoints_teacher_v4/best.pt
+    ground_truth_epochs: 5
+    ramp_end_epoch: 10
+    metric_weight: 1.0
+    gradient_weight: 0.1
+    teacher_depth_weight: 0.5
+    feature_weight: 0.05
+    inside_coverage_weight: 1.0
+    outside_coverage_weight: 2.0
+    confidence_temperature: 0.25
+    smooth_l1_beta: 0.1
+    student_feature_channels: [64, 96]
+    teacher_feature_channels: [128, 192]
+    teacher_model:
+      architecture: teacher_v4
+      image_channels: 3
+      depth_scale: 10.0
+      positive_output: true
+      fallback_depth: 1.0
+      attention_dim: 64
+      attention_heads: 4
+      geometry_heads: 2
+      refine_channels: 16
+      backbone_name: depth-anything/Depth-Anything-V2-Large-hf
+      backbone_input_size: [518, 686]
+      backbone_dtype: float16
+      local_files_only: false
+      fusion_scales: ["1_16", "1_8"]
+      use_appearance_pooling: true
+  tensorboard:
+    enabled: true
+    log_dir: runs/student_v5
+    image_every: 1
+    num_images: 2
+    depth_min: 0.0
+    depth_max: null
+
+evaluation:
+  device: auto
+  split: test
+  max_batches: null
+  visualize: false
+  visualization_dir: evaluation_outputs_student_v5
+  num_visualizations: 8
+  depth_min: 0.0
+  depth_max: null

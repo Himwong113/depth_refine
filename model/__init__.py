@@ -10,6 +10,7 @@ from .legacy import (
     LiteDecoderBlock,
 )
 from .model import DepthOutput, MobileDepthStudent
+from .student_v5 import EfficientFormerDepthStudent
 from .teacher import RGBToFTeacher
 from .tof import FootprintAwareToFAttention, tof_coverage_mask
 
@@ -22,6 +23,7 @@ __all__ = [
     "GeometryAwareToFAttention",
     "LiteDecoderBlock",
     "DepthOutput",
+    "EfficientFormerDepthStudent",
     "FootprintAwareToFAttention",
     "MobileDepthStudent",
     "RGBToFTeacher",

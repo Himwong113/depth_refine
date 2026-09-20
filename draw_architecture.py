@@ -38,7 +38,7 @@ def arrow(ax, points, color=INK, dashed=False):
 
 def render():
     plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 9,
-                         "svg.fonttype": "none", "svg.hashsalt": "depth-v4",
+                         "svg.fonttype": "none", "svg.hashsalt": "depth-v5",
                          "pdf.fonttype": 42, "ps.fonttype": 42})
     fig = plt.figure(figsize=(15.8, 8.5), facecolor="white")
     ax = fig.add_axes((0.02, 0.03, 0.96, 0.94))
@@ -53,12 +53,12 @@ def render():
         label(ax, 0.15, y+0.22, "Stage A" if teacher else "Stage B", 8, GRAY, ha="left")
         block(ax, 1.35, y, 1.25, 0.9, "RGB", "3 × H × W", GRAY, "#f7f8fa")
         block(ax, 3.05, y, 2.55, 0.9,
-              "Depth Anything V2-L" if teacher else "Mobile RGB encoder",
-              "Frozen backbone + neck" if teacher else "Resize to 320 × 240",
+              "Depth Anything V2-L" if teacher else "EfficientFormerV2-S0",
+              "Frozen backbone + neck" if teacher else "Scratch · fixed 256 × 320",
               GRAY if teacher else color, "#f0f2f4" if teacher else fill)
         block(ax, 6.05, y, 2.3, 0.9,
               "Pyramid projections" if teacher else "Feature pyramid",
-              "64 / 96 / 128 / 192 channels" if teacher else "32 / 64 / 96 / 128 channels", color, fill)
+              "64 / 96 / 128 / 192 channels" if teacher else "32 / 48 / 96 / 176 + detail branch", color, fill)
         block(ax, 8.85, y, 3.65, 0.9, "ToF fusion + additive decoder",
               "1/16 + 1/8 fusion  ·  " + ("4 heads" if teacher else "2 heads"), color, fill)
         block(ax, 13.0, y, 2.75, 0.9, "Metric-depth head",
@@ -76,7 +76,7 @@ def render():
         block(ax, x, 5.89, w, 0.42, title, color=OCHRE, fill="#fbf5ec")
         arrow(ax, [(cx, 6.75), (cx, 6.31)], OCHRE, True)
         arrow(ax, [(cx, 5.45), (cx, 5.89)], OCHRE, True)
-    label(ax, 1.35, 4.12, "Deployment: student only · 141.7K parameters", 8, TEAL, "bold", ha="left")
+    label(ax, 1.35, 4.12, "Deployment: student only · 3.39M parameters · 480 × 640 depth", 8, TEAL, "bold", ha="left")
     label(ax, 15.75, 3.75, "Both heads: residual + valid-token mean anchor → positive metric depth", 7.6, GRAY, ha="right")
     ax.plot([0.1, 15.85], [3.52, 3.52], color="#ccd3d9", linewidth=0.7)
     ax.plot([8.05, 8.05], [0.43, 3.28], color="#dce1e6", linewidth=0.7)
@@ -103,8 +103,8 @@ def render():
           r"$\mathcal{L}=\mathcal{L}_{\mathrm{MSE}}+0.1\mathcal{L}_{\mathrm{grad}}+r(e)\,[0.5\mathcal{L}_{\mathrm{depth}}+0.05\mathcal{L}_{\mathrm{feat}}]$",
           12, ha="left")
     label(ax, 8.4, 1.80, "Depth: Smooth L1  ·  Features: cosine loss after 1 × 1 adapters", 8, GRAY, ha="left")
-    label(ax, 8.4, 1.39, "Coverage weights: outside 2 / inside 1; normalize before confidence.", 8, GRAY, ha="left")
-    label(ax, 8.4, 1.00, r"Confidence: $\exp(-|D_T-D_{GT}|/0.25)$; valid target pixels only.", 8, GRAY, ha="left")
+    label(ax, 8.4, 1.39, "Coverage weights: outside 2 / inside 1; area-pooled for feature transfer.", 8, GRAY, ha="left")
+    label(ax, 8.4, 1.00, r"Confidence: $\exp(-|D_T-D_{GT}|/0.25)$ attenuates the teacher gradient.", 8, GRAY, ha="left")
     label(ax, 8.4, 0.55, "Schedule: GT only (1–5) → ramp (6–10) → full distillation", 8, OCHRE, ha="left")
     arrow(ax, [(0.2, 0.12), (0.7, 0.12)])
     label(ax, 0.82, 0.12, "Feature flow", 7.5, GRAY, ha="left")

@@ -25,6 +25,48 @@ See [RGB and calibrated-ToF alignment](docs/tof_rgb_alignment.md) for the
 coordinate equations, an example, augmentation rules, and implementation
 details.
 
+## Scratch EfficientFormerV2 student v5
+
+`student_v5` uses the EfficientFormerV2-S0 architecture with random weights;
+it does not download or load ImageNet weights. The RGB semantic branch runs at
+a fixed 256×320 resolution and supplies four feature scales. A shallow
+full-resolution RGB branch preserves 1/4-scale detail, and the existing
+calibrated ToF cross-attention remains active at 1/16 and 1/8.
+
+The complete student has 3,393,614 parameters (about 6.47 MiB of FP16
+parameters) and still returns 480×640 metric depth. A local RTX 4070 Ti
+implementation check measured 7.22 ms p50, 7.86 ms p95, and 85.6 MiB peak
+allocated CUDA memory. These numbers verify the local graph only; the 33 ms
+iPhone target requires a Core ML measurement on the intended phone.
+
+The encoder trains from epoch one at the same learning rate as the decoder.
+Epochs 1–5 use ground truth only, epochs 6–10 ramp in the frozen teacher, and
+the corrected v5 loss lets low teacher confidence reduce the absolute
+distillation gradient. The teacher remains the pretrained Depth Anything V2
+teacher; only the student encoder is scratch initialized.
+
+Train, inspect, evaluate, and export V5 with:
+
+```bash
+python main.py --config configs/student_v5.yml --para-summary
+python train.py --config configs/student_v5.yml
+python train.py --config configs/student_v5_supervised.yml  # GT-only control
+python eval.py \
+  --config configs/student_v5.yml \
+  --checkpoint checkpoints_student_v5/best.pt \
+  --split val
+python export_student.py \
+  --config configs/student_v5.yml \
+  --checkpoint checkpoints_student_v5/best.pt \
+  --output student_v5_480x640.pt
+python benchmark_student.py \
+  --config configs/student_v5.yml \
+  --checkpoint checkpoints_student_v5/best.pt
+```
+
+The detailed implementation and experiment specification is in
+[the V5 implementation plan](plans/student_v5_efficientformer_implementation_plan.md).
+
 ## Teacher/student v4
 
 The research path is now implemented as two explicit architectures:
@@ -128,6 +170,8 @@ python main.py --config configs/teacher_v4.yml --para-summary
 
 # Deployable mobile student
 python main.py --config configs/student_v4.yml --para-summary
+
+python main.py --config configs/student_v5.yml --para-summary
 ```
 
 The summary prints:
@@ -316,6 +360,12 @@ python train.py \
 The Depth Anything weights are external pretrained initialization; ZJU-L5 is
 the only dataset used for task-specific teacher and student optimization.
 
+For the scratch EfficientFormerV2 student, use
+`python train.py --config configs/student_v5.yml`. Its
+`student_distillation_v5` objective preserves the same online teacher
+workflow while applying corrected confidence attenuation and area-pooled
+feature masks.
+
 ## Evaluation
 
 Evaluate the best checkpoint on the held-out test scenes:
@@ -358,8 +408,18 @@ The legacy baseline remains in `config.yml`; v4 settings are in `configs/`.
 ## Student export
 
 Export a fixed 480×640 TorchScript graph after student training. The exporter
-strictly loads only student weights and checks PyTorch/TorchScript parity before
-writing the artifact:
+supports both `student_v4` and `student_v5`; use the matching configuration
+and checkpoint. For V5:
+
+```bash
+python export_student.py \
+  --config configs/student_v5.yml \
+  --checkpoint checkpoints_student_v5/best.pt \
+  --output student_v5_480x640.pt
+```
+
+The exporter strictly loads only student weights and checks
+PyTorch/TorchScript parity before writing the artifact. For V4:
 
     python export_student.py \
       --config configs/student_v4.yml \
