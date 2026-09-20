@@ -55,6 +55,12 @@ The implementation and experiment sequence are described in
 
 ![RGB–ToF teacher–student architecture](docs/depth_refinement_architecture.png)
 
+Paper figure: [vector PDF](docs/depth_refinement_architecture.pdf),
+[editable SVG](docs/depth_refinement_architecture.svg), or the 400-dpi PNG above.
+Panels show the model framework, appearance-enriched sensor fusion, and
+coverage-aware distillation. Regenerate all three with
+`python draw_architecture.py` (requires Matplotlib).
+
 ## Legacy baseline (attention_v3)
 
 Each valid ToF zone is retained as one compact conditioning token containing:
@@ -71,8 +77,6 @@ bias favors rectangles near each query without forbidding global context. A
 single decoder uses additive RGB skip connections, and the full-resolution head
 never receives the rectangular ToF raster. This prevents calibrated zone
 boundaries from being copied directly into the prediction.
-
-Regenerate the PNG and editable SVG with `python draw_architecture.py`.
 
     RGB → separable encoder (1/2–1/16) ─┐ queries
                                         ├→ geometric cross-attention
@@ -106,10 +110,38 @@ Teacher training additionally requires the lazy, non-deployment dependency:
 
     python -m pip install -r requirements-teacher.txt
 
-Inspect the configuration, parameter count, and one real batch:
+Inspect the default configuration and one real batch:
 
     python main.py
-    python main.py --para-summary
+
+### Model parameter count and size
+
+Use `--para-summary` with the configuration for the architecture you want to
+inspect:
+
+```bash
+# Legacy attention-v3 baseline
+python main.py --config config.yml --para-summary
+
+# Frozen-backbone teacher
+python main.py --config configs/teacher_v4.yml --para-summary
+
+# Deployable mobile student
+python main.py --config configs/student_v4.yml --para-summary
+```
+
+The summary prints:
+
+- total and trainable parameter counts;
+- parameter storage using `summary.parameter_dtype` from the YAML file;
+- registered buffer memory; and
+- estimated parameter-plus-buffer model size.
+
+The student configuration reports FP16 storage and currently contains about
+141,694 parameters. The reported size is model storage only; it excludes
+activations, gradients, optimizer state, framework overhead, and input/output
+buffers. Those additional allocations must be measured separately when
+reporting training or deployment memory.
 
 The expected training tensors are:
 

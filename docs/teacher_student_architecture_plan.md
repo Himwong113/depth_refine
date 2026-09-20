@@ -219,6 +219,19 @@ Confirm the final candidates across scene-disjoint development folds and seeds 4
 
 ## Tests and verification
 
+Inspect parameter counts and parameter-plus-buffer storage for each v4 model
+with:
+
+```bash
+python main.py --config configs/teacher_v4.yml --para-summary
+python main.py --config configs/student_v4.yml --para-summary
+```
+
+The reported storage uses `summary.parameter_dtype` from the selected config
+and excludes activations, gradients, optimizer state, runtime overhead, and
+input/output buffers. Deployment-memory acceptance therefore still requires a
+runtime measurement on the target phone.
+
 - Frozen teacher RGB weights receive no gradients.
 - Teacher fusion, decoder, and student parameters receive finite gradients.
 - Invalid tokens cannot change predictions.

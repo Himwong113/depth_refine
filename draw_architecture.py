@@ -1,392 +1,125 @@
-"""Render the RGB–ToF teacher/student architecture diagram."""
-
-from __future__ import annotations
-
+"""Render a publication figure with editable SVG and vector PDF companions."""
 from pathlib import Path
 
 import matplotlib
-
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.patches import FancyArrowPatch, FancyBboxPatch
 
-
 OUTPUT_DIR = Path(__file__).resolve().parent / "docs"
-INK = "#172033"
-MUTED = "#64748b"
-RGB = "#dbeafe"
-RGB_EDGE = "#2563eb"
-TOF = "#dcfce7"
-TOF_EDGE = "#16a34a"
-ENC = "#e0e7ff"
-ENC_EDGE = "#4f46e5"
-DEC = "#ffedd5"
-DEC_EDGE = "#ea580c"
-HEAD = "#f3e8ff"
-HEAD_EDGE = "#9333ea"
-FROZEN = "#e2e8f0"
-FROZEN_EDGE = "#475569"
-LOSS = "#fce7f3"
-LOSS_EDGE = "#db2777"
+INK, GRAY = "#263342", "#596675"
+BLUE, TEAL, OCHRE = "#345f87", "#267b75", "#a16b29"
 
 
-def box(
-    axis,
-    x: float,
-    y: float,
-    width: float,
-    height: float,
-    title: str,
-    detail: str,
-    face: str,
-    edge: str,
-) -> tuple[float, float, float, float]:
-    patch = FancyBboxPatch(
-        (x, y),
-        width,
-        height,
-        boxstyle="round,pad=0.04,rounding_size=0.09",
-        linewidth=1.7,
-        edgecolor=edge,
-        facecolor=face,
-    )
-    axis.add_patch(patch)
-    axis.text(
-        x + width / 2,
-        y + height * 0.63,
-        title,
-        ha="center",
-        va="center",
-        fontsize=8.3,
-        fontweight="bold",
-        color=INK,
-    )
-    axis.text(
-        x + width / 2,
-        y + height * 0.28,
-        detail,
-        ha="center",
-        va="center",
-        fontsize=6.8,
-        color=MUTED,
-    )
-    return x, y, width, height
+def label(ax, x, y, text, size=9, color=INK, weight="normal", ha="center"):
+    ax.text(x, y, text, fontsize=size, color=color, weight=weight,
+            ha=ha, va="center", linespacing=1.5, zorder=5)
 
 
-def center_right(bounds):
-    x, y, width, height = bounds
-    return x + width, y + height / 2
+def block(ax, x, y, w, h, title, detail="", color=BLUE, fill="#edf3f8"):
+    ax.add_patch(FancyBboxPatch(
+        (x, y), w, h, boxstyle="round,pad=0,rounding_size=0.05",
+        facecolor=fill, edgecolor=color, linewidth=0.9, zorder=3))
+    label(ax, x+w/2, y+h*(0.69 if detail else 0.5), title, 9, color, "bold")
+    if detail:
+        label(ax, x+w/2, y+h*0.30, detail, 7.6, GRAY)
 
 
-def center_left(bounds):
-    x, y, _, height = bounds
-    return x, y + height / 2
+def arrow(ax, points, color=INK, dashed=False):
+    style = (0, (3, 2.5)) if dashed else "-"
+    if len(points) > 2:
+        ax.plot(*zip(*points[:-1]), color=color, linewidth=1,
+                linestyle=style, zorder=2)
+    ax.add_patch(FancyArrowPatch(
+        points[-2], points[-1], arrowstyle="-|>", mutation_scale=9,
+        color=color, linewidth=1, linestyle=style,
+        shrinkA=0, shrinkB=1, zorder=2))
 
 
-def center_top(bounds):
-    x, y, width, height = bounds
-    return x + width / 2, y + height
+def render():
+    plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 9,
+                         "svg.fonttype": "none", "svg.hashsalt": "depth-v4",
+                         "pdf.fonttype": 42, "ps.fonttype": 42})
+    fig = plt.figure(figsize=(15.8, 8.5), facecolor="white")
+    ax = fig.add_axes((0.02, 0.03, 0.96, 0.94))
+    ax.set(xlim=(0, 16), ylim=(0, 8.5))
+    ax.axis("off")
+    label(ax, 0.1, 8.22, "(a)  RGB–ToF teacher–student framework", 10.5, weight="bold", ha="left")
+    label(ax, 15.8, 8.22, "Input / output resolution: 640 × 480", 8, GRAY, ha="right")
 
+    for y, teacher in ((6.75, True), (4.55, False)):
+        color, fill = (BLUE, "#edf3f8") if teacher else (TEAL, "#eaf4f1")
+        label(ax, 0.15, y+0.55, "Teacher" if teacher else "Student", 10, color, "bold", ha="left")
+        label(ax, 0.15, y+0.22, "Stage A" if teacher else "Stage B", 8, GRAY, ha="left")
+        block(ax, 1.35, y, 1.25, 0.9, "RGB", "3 × H × W", GRAY, "#f7f8fa")
+        block(ax, 3.05, y, 2.55, 0.9,
+              "Depth Anything V2-L" if teacher else "Mobile RGB encoder",
+              "Frozen backbone + neck" if teacher else "Resize to 320 × 240",
+              GRAY if teacher else color, "#f0f2f4" if teacher else fill)
+        block(ax, 6.05, y, 2.3, 0.9,
+              "Pyramid projections" if teacher else "Feature pyramid",
+              "64 / 96 / 128 / 192 channels" if teacher else "32 / 64 / 96 / 128 channels", color, fill)
+        block(ax, 8.85, y, 3.65, 0.9, "ToF fusion + additive decoder",
+              "1/16 + 1/8 fusion  ·  " + ("4 heads" if teacher else "2 heads"), color, fill)
+        block(ax, 13.0, y, 2.75, 0.9, "Metric-depth head",
+              ("16-ch" if teacher else "8-ch") + " refinement → 1 × H × W", color, fill)
+        for start, end in ((2.6, 3.05), (5.6, 6.05), (8.35, 8.85), (12.5, 13.0)):
+            arrow(ax, [(start, y+0.45), (end, y+0.45)])
 
-def center_bottom(bounds):
-    x, y, width, _ = bounds
-    return x + width / 2, y
+    block(ax, 6.05, 7.82, 2.3, 0.30, "64 calibrated ToF tokens", color=GRAY, fill="white")
+    arrow(ax, [(8.35, 7.97), (10.65, 7.97), (10.65, 7.65)], TEAL)
+    block(ax, 6.05, 3.98, 2.3, 0.30, "64 calibrated ToF tokens", color=GRAY, fill="white")
+    arrow(ax, [(8.35, 4.13), (10.65, 4.13), (10.65, 4.55)], TEAL)
+    label(ax, 1.35, 6.22, "Stage A: train projections, fusion and decoder.\nStage B: freeze the entire teacher.", 8, GRAY, ha="left")
+    for x, w, title in ((8.88, 3.55, "Spatial-feature distillation"), (13.05, 2.65, "Depth distillation")):
+        cx = x+w/2
+        block(ax, x, 5.89, w, 0.42, title, color=OCHRE, fill="#fbf5ec")
+        arrow(ax, [(cx, 6.75), (cx, 6.31)], OCHRE, True)
+        arrow(ax, [(cx, 5.45), (cx, 5.89)], OCHRE, True)
+    label(ax, 1.35, 4.12, "Deployment: student only · 141.7K parameters", 8, TEAL, "bold", ha="left")
+    label(ax, 15.75, 3.75, "Both heads: residual + valid-token mean anchor → positive metric depth", 7.6, GRAY, ha="right")
+    ax.plot([0.1, 15.85], [3.52, 3.52], color="#ccd3d9", linewidth=0.7)
+    ax.plot([8.05, 8.05], [0.43, 3.28], color="#dce1e6", linewidth=0.7)
+    label(ax, 0.1, 3.20, "(b)  Appearance-enriched sensor fusion", 10.5, weight="bold", ha="left")
+    label(ax, 8.35, 3.20, "(c)  Coverage-aware knowledge transfer", 10.5, weight="bold", ha="left")
 
+    block(ax, 0.15, 2.08, 1.8, 0.72, "RGB features", "1/16 resolution")
+    block(ax, 0.15, 0.97, 1.8, 0.72, "ToF tokens", "mean, std, valid, box", TEAL, "#eaf4f1")
+    block(ax, 2.42, 2.08, 2.0, 0.72, "Footprint pooling", "Appearance per zone", TEAL, "#eaf4f1")
+    block(ax, 2.42, 0.97, 2.0, 0.72, "Concatenate + MLP", "Appearance + sensor", TEAL, "#eaf4f1")
+    block(ax, 4.95, 0.97, 2.65, 0.72, "Cross-attention", "Geometry + global heads", TEAL, "#eaf4f1")
+    arrow(ax, [(1.95, 2.44), (2.42, 2.44)])
+    arrow(ax, [(1.95, 1.33), (2.42, 1.33)], TEAL)
+    arrow(ax, [(3.42, 2.08), (3.42, 1.69)], TEAL)
+    arrow(ax, [(4.42, 1.33), (4.95, 1.33)], TEAL)
+    label(ax, 4.69, 1.57, "K,V", 7.2, TEAL)
+    label(ax, 6.28, 2.72, "Decoder features at 1/16 or 1/8", 7.7, BLUE)
+    arrow(ax, [(6.28, 2.48), (6.28, 1.69)], BLUE)
+    label(ax, 6.48, 2.12, "Q", 8, BLUE)
+    label(ax, 0.15, 0.55, "Separate teacher / student weights · invalid-token mask · learnable null token", 7.5, GRAY, ha="left")
 
-def arrow(axis, start, end, color=INK, dashed=False, curve=0.0):
-    axis.add_patch(
-        FancyArrowPatch(
-            start,
-            end,
-            arrowstyle="-|>",
-            mutation_scale=10,
-            linewidth=1.35,
-            color=color,
-            linestyle="--" if dashed else "-",
-            connectionstyle=f"arc3,rad={curve}",
-            shrinkA=3,
-            shrinkB=3,
-        )
-    )
+    label(ax, 8.4, 2.75, "Teacher targets are detached; gradients update the student and adapters.", 7.8, GRAY, ha="left")
+    label(ax, 8.4, 2.28,
+          r"$\mathcal{L}=\mathcal{L}_{\mathrm{MSE}}+0.1\mathcal{L}_{\mathrm{grad}}+r(e)\,[0.5\mathcal{L}_{\mathrm{depth}}+0.05\mathcal{L}_{\mathrm{feat}}]$",
+          12, ha="left")
+    label(ax, 8.4, 1.80, "Depth: Smooth L1  ·  Features: cosine loss after 1 × 1 adapters", 8, GRAY, ha="left")
+    label(ax, 8.4, 1.39, "Coverage weights: outside 2 / inside 1; normalize before confidence.", 8, GRAY, ha="left")
+    label(ax, 8.4, 1.00, r"Confidence: $\exp(-|D_T-D_{GT}|/0.25)$; valid target pixels only.", 8, GRAY, ha="left")
+    label(ax, 8.4, 0.55, "Schedule: GT only (1–5) → ramp (6–10) → full distillation", 8, OCHRE, ha="left")
+    arrow(ax, [(0.2, 0.12), (0.7, 0.12)])
+    label(ax, 0.82, 0.12, "Feature flow", 7.5, GRAY, ha="left")
+    arrow(ax, [(2.5, 0.12), (3.0, 0.12)], OCHRE, True)
+    label(ax, 3.12, 0.12, "Training supervision", 7.5, GRAY, ha="left")
+    label(ax, 15.8, 0.12, "Fusion is interleaved with decoding; RGB skip connections are summarized.", 7, GRAY, ha="right")
 
-
-def render() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    figure, axis = plt.subplots(figsize=(18, 10), facecolor="white")
-    axis.set_xlim(0, 18)
-    axis.set_ylim(0, 10)
-    axis.axis("off")
-
-    axis.text(
-        0.45,
-        9.55,
-        "RGB–ToF teacher–student metric-depth refinement",
-        fontsize=18,
-        fontweight="bold",
-        color=INK,
-    )
-    axis.text(
-        0.45,
-        9.18,
-        "Stage A learns a strong frozen-backbone teacher • Stage B distills to "
-        "a 141.7K-parameter mobile student • only the student deploys",
-        fontsize=9,
-        color=MUTED,
-    )
-
-    teacher_band = FancyBboxPatch(
-        (2.65, 5.72),
-        14.75,
-        2.75,
-        boxstyle="round,pad=0.04,rounding_size=0.12",
-        linewidth=1.0,
-        edgecolor="#bfdbfe",
-        facecolor="#f8fbff",
-        zorder=-2,
-    )
-    student_band = FancyBboxPatch(
-        (2.65, 0.88),
-        14.75,
-        2.75,
-        boxstyle="round,pad=0.04,rounding_size=0.12",
-        linewidth=1.0,
-        edgecolor="#c7d2fe",
-        facecolor="#fafaff",
-        zorder=-2,
-    )
-    axis.add_patch(teacher_band)
-    axis.add_patch(student_band)
-    axis.text(
-        2.9,
-        8.18,
-        "STAGE A — TRAIN TEACHER",
-        fontsize=8.5,
-        fontweight="bold",
-        color=RGB_EDGE,
-    )
-    axis.text(
-        2.9,
-        3.34,
-        "STAGE B — DISTILL INTO STUDENT",
-        fontsize=8.5,
-        fontweight="bold",
-        color=ENC_EDGE,
-    )
-
-    rgb = box(axis, 0.4, 7.05, 1.65, 0.95, "RGB", "3 × 480 × 640", RGB, RGB_EDGE)
-    tof = box(
-        axis,
-        0.4,
-        5.62,
-        1.65,
-        1.05,
-        "Calibrated ToF",
-        "64 × 7 tokens\nmean/std/valid/box",
-        TOF,
-        TOF_EDGE,
-    )
-    target = box(
-        axis,
-        0.4,
-        4.15,
-        1.65,
-        0.95,
-        "Ground truth",
-        "valid metric depth",
-        HEAD,
-        HEAD_EDGE,
-    )
-
-    teacher_rgb = box(
-        axis,
-        3.0,
-        6.43,
-        2.15,
-        1.15,
-        "Depth Anything V2-L",
-        "frozen backbone + neck\nno gradients • eval mode",
-        FROZEN,
-        FROZEN_EDGE,
-    )
-    teacher_pyramid = box(
-        axis,
-        5.75,
-        6.43,
-        2.05,
-        1.15,
-        "Trainable pyramid",
-        "64/96/128/192 ch\n1/2 • 1/4 • 1/8 • 1/16",
-        ENC,
-        ENC_EDGE,
-    )
-    teacher_fusion = box(
-        axis,
-        8.4,
-        6.43,
-        2.15,
-        1.15,
-        "Teacher ToF fusion",
-        "footprint appearance\n4 heads • 1/16 + 1/8",
-        TOF,
-        TOF_EDGE,
-    )
-    teacher_decoder = box(
-        axis,
-        11.15,
-        6.43,
-        2.15,
-        1.15,
-        "Teacher decoder",
-        "additive RGB skips\n16-ch full-res refine",
-        DEC,
-        DEC_EDGE,
-    )
-    teacher_output = box(
-        axis,
-        13.9,
-        6.43,
-        2.95,
-        1.15,
-        "Teacher metric depth + features",
-        "640 × 480 depth\nfused features at 1/8 + 1/16",
-        HEAD,
-        HEAD_EDGE,
-    )
-
-    distillation = box(
-        axis,
-        11.55,
-        4.18,
-        3.1,
-        1.05,
-        "Coverage-aware objectives",
-        "GT MSE + gradients • teacher depth\nfeature cosine • 2× outside ToF",
-        LOSS,
-        LOSS_EDGE,
-    )
-
-    student_rgb = box(
-        axis,
-        3.0,
-        1.58,
-        2.15,
-        1.15,
-        "Mobile RGB encoder",
-        "internal 320 × 240\n32/64/96/128 ch",
-        RGB,
-        RGB_EDGE,
-    )
-    student_fusion = box(
-        axis,
-        5.75,
-        1.58,
-        2.05,
-        1.15,
-        "Student ToF fusion",
-        "footprint appearance\n2 heads • 1/16 + 1/8",
-        TOF,
-        TOF_EDGE,
-    )
-    student_decoder = box(
-        axis,
-        8.4,
-        1.58,
-        2.15,
-        1.15,
-        "Lightweight decoder",
-        "additive skips\ndecode only to 1/4",
-        DEC,
-        DEC_EDGE,
-    )
-    student_head = box(
-        axis,
-        11.15,
-        1.58,
-        2.15,
-        1.15,
-        "Full-resolution head",
-        "8-ch projection + RGB\npositive residual + ToF anchor",
-        DEC,
-        DEC_EDGE,
-    )
-    student_output = box(
-        axis,
-        13.9,
-        1.58,
-        2.95,
-        1.15,
-        "Deployed metric depth",
-        "1 × 480 × 640\nteacher-free single pass",
-        HEAD,
-        HEAD_EDGE,
-    )
-
-    arrow(axis, center_right(rgb), center_left(teacher_rgb), RGB_EDGE)
-    arrow(axis, center_right(teacher_rgb), center_left(teacher_pyramid), FROZEN_EDGE)
-    arrow(axis, center_right(teacher_pyramid), center_left(teacher_fusion), ENC_EDGE)
-    arrow(axis, center_right(teacher_fusion), center_left(teacher_decoder), TOF_EDGE)
-    arrow(axis, center_right(teacher_decoder), center_left(teacher_output), DEC_EDGE)
-
-    arrow(axis, center_right(rgb), center_left(student_rgb), RGB_EDGE, curve=0.32)
-    arrow(axis, center_right(student_rgb), center_left(student_fusion), RGB_EDGE)
-    arrow(axis, center_right(student_fusion), center_left(student_decoder), TOF_EDGE)
-    arrow(axis, center_right(student_decoder), center_left(student_head), DEC_EDGE)
-    arrow(axis, center_right(student_head), center_left(student_output), HEAD_EDGE)
-
-    arrow(axis, center_right(tof), center_left(teacher_fusion), TOF_EDGE, curve=0.3)
-    arrow(axis, center_right(tof), center_left(student_fusion), TOF_EDGE, curve=0.22)
-    arrow(
-        axis,
-        center_bottom(teacher_output),
-        center_top(distillation),
-        LOSS_EDGE,
-        dashed=True,
-        curve=0.12,
-    )
-    arrow(
-        axis,
-        center_right(target),
-        center_left(distillation),
-        LOSS_EDGE,
-        dashed=True,
-        curve=-0.06,
-    )
-    arrow(
-        axis,
-        center_top(student_head),
-        center_bottom(distillation),
-        LOSS_EDGE,
-        dashed=True,
-        curve=-0.12,
-    )
-
-    axis.text(
-        9.0,
-        0.38,
-        "Solid: inference feature flow   •   Dashed magenta: training-only "
-        "supervision   •   teacher and adapters are absent from deployment",
-        ha="center",
-        fontsize=8,
-        color=MUTED,
-    )
-
-    svg_path = OUTPUT_DIR / "depth_refinement_architecture.svg"
-    figure.savefig(
-        svg_path,
-        bbox_inches="tight",
-        facecolor="white",
-    )
-    svg_path.write_text(
-        "\n".join(line.rstrip() for line in svg_path.read_text().splitlines()) + "\n",
-        encoding="utf-8",
-    )
-    figure.savefig(
-        OUTPUT_DIR / "depth_refinement_architecture.png",
-        dpi=220,
-        bbox_inches="tight",
-        facecolor="white",
-    )
-    plt.close(figure)
+    for ext in ("png", "svg", "pdf"):
+        path = OUTPUT_DIR / f"depth_refinement_architecture.{ext}"
+        metadata = {"Date": None} if ext == "svg" else None
+        fig.savefig(path, dpi=400, facecolor="white", bbox_inches="tight", pad_inches=0.08, metadata=metadata)
+        if ext == "svg":
+            path.write_text("\n".join(line.rstrip() for line in path.read_text(encoding="utf-8").splitlines())+"\n", encoding="utf-8")
+    plt.close(fig)
 
 
 if __name__ == "__main__":
