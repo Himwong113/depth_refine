@@ -42,7 +42,7 @@ logs/
 wandb/
 lightning_logs/
 tensorboard/
-
+evaluation_**/
 # Local datasets (the ZJU-L5 dataset is configured by absolute path)
 datasets/
 *.h5
