@@ -118,8 +118,8 @@ class ZJUL5Dataset(Dataset[dict[str, Any]]):
         ``sparse_depth``: raw ToF mean depth shaped ``(1, 8, 8)``.
         ``tof_features``: calibrated mean/std/validity shaped ``(3, H, W)``.
         ``tof_tokens``: 64 mean/std/validity/rectangle tokens shaped ``(64, 7)``.
-        ``target_depth``: high-resolution depth shaped ``(1, 480, 640)``, with
-        valid values clamped to the configured metric range.
+        ``target_depth``: high-resolution depth shaped ``(1, 480, 640)``;
+        values outside the configured metric range are invalid and zeroed.
         ``target_valid_mask``: valid target pixels shaped ``(1, 480, 640)``.
         ``sparse_valid_mask``: valid ToF zones shaped ``(1, 8, 8)``.
         ``path``: path of the source HDF5 file relative to the dataset root.
@@ -137,6 +137,7 @@ class ZJUL5Dataset(Dataset[dict[str, Any]]):
         image_std: tuple[float, float, float] | list[float] = (0.229, 0.224, 0.225),
         min_depth: float = 0.1,
         max_depth: float = 10.0,
+        legacy_clamp_out_of_range: bool = False,
         augment: bool = False,
         horizontal_flip_probability: float = 0.5,
         photometric_probability: float = 0.5,
@@ -204,6 +205,7 @@ class ZJUL5Dataset(Dataset[dict[str, Any]]):
         self.image_std = torch.tensor(image_std, dtype=torch.float32).view(3, 1, 1)
         self.min_depth = min_depth
         self.max_depth = max_depth
+        self.legacy_clamp_out_of_range = bool(legacy_clamp_out_of_range)
         self.augment = augment and split == "train"
         self.horizontal_flip_probability = horizontal_flip_probability
         self.photometric_probability = photometric_probability
@@ -266,12 +268,21 @@ class ZJUL5Dataset(Dataset[dict[str, Any]]):
             rgb.shape[:2],
         )
 
-        target_valid_mask_array = np.isfinite(target_depth) & (target_depth > 0)
-        target_depth = np.where(
-            target_valid_mask_array,
-            np.clip(target_depth, self.min_depth, self.max_depth),
-            0.0,
-        )
+        finite_positive = np.isfinite(target_depth) & (target_depth > 0)
+        if self.legacy_clamp_out_of_range:
+            target_valid_mask_array = finite_positive
+            target_depth = np.where(
+                target_valid_mask_array,
+                np.clip(target_depth, self.min_depth, self.max_depth),
+                0.0,
+            )
+        else:
+            target_valid_mask_array = (
+                finite_positive
+                & (target_depth >= self.min_depth)
+                & (target_depth <= self.max_depth)
+            )
+            target_depth = np.where(target_valid_mask_array, target_depth, 0.0)
 
         target_depth_tensor = torch.from_numpy(
             np.ascontiguousarray(target_depth[None, ...])
@@ -347,6 +358,9 @@ def build_zjul5_dataloader(config: dict[str, Any]) -> DataLoader[dict[str, Any]]
         "image_std": config.get("image_std", (0.229, 0.224, 0.225)),
         "min_depth": config.get("min_depth", 0.1),
         "max_depth": config.get("max_depth", 10.0),
+        "legacy_clamp_out_of_range": config.get(
+            "legacy_clamp_out_of_range", False
+        ),
         "augment": config.get("augment", False),
         "horizontal_flip_probability": config.get(
             "horizontal_flip_probability", 0.5

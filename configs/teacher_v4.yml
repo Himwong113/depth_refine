@@ -1,0 +1,83 @@
+# Stage A: train the RGB/ToF teacher on ZJU-L5 only.
+model:
+  architecture: teacher_v4
+  image_channels: 3
+  depth_scale: 10.0
+  positive_output: true
+  fallback_depth: 1.0
+  attention_dim: 64
+  attention_heads: 4
+  geometry_heads: 2
+  refine_channels: 16
+  backbone_name: depth-anything/Depth-Anything-V2-Large-hf
+  backbone_input_size: [518, 686]
+  backbone_dtype: float16
+  local_files_only: false
+  fusion_scales: ["1_16", "1_8"]
+  use_appearance_pooling: true
+
+summary:
+  parameter_dtype: float16
+  show_architecture: false
+
+data:
+  root: /home/himwong/Downloads/ZJUL5/ZJUL5
+  manifest: data.json
+  split: train
+  batch_size: 1
+  shuffle: true
+  num_workers: 0
+  pin_memory: true
+  drop_last: false
+  seed: 42
+  normalize_image: true
+  image_mean: [0.485, 0.456, 0.406]
+  image_std: [0.229, 0.224, 0.225]
+  min_depth: 0.1
+  max_depth: 10.0
+  legacy_clamp_out_of_range: false
+  augment: true
+  horizontal_flip_probability: 0.5
+  photometric_probability: 0.5
+  inspect_first_batch: true
+
+training:
+  objective: teacher_v4
+  device: auto
+  epochs: 30
+  resume_from: null
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+  lr_scheduler: cosine
+  warmup_epochs: 3
+  warmup_start_factor: 0.1
+  minimum_learning_rate: 0.000001
+  loss: mse
+  metric_weight: 1.0
+  gradient_weight: 0.1
+  gradient_clip_norm: 1.0
+  amp: true
+  log_every: 10
+  validation_split: val
+  validation_every: 1
+  checkpoint_dir: checkpoints_teacher_v4
+  save_every: 5
+  max_train_batches: null
+  max_validation_batches: null
+  tensorboard:
+    enabled: true
+    log_dir: runs/teacher_v4
+    image_every: 1
+    num_images: 2
+    depth_min: 0.0
+    depth_max: null
+
+evaluation:
+  device: auto
+  split: test
+  max_batches: null
+  visualize: false
+  visualization_dir: evaluation_outputs_teacher_v4
+  num_visualizations: 8
+  depth_min: 0.0
+  depth_max: null

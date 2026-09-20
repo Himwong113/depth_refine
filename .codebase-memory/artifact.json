@@ -1,11 +1,11 @@
 {
     "schema_version": 2,
-    "commit": "8e8950ff50fc19fe3e116881b8cdfdca1a4556d3",
-    "indexed_at": "2026-09-20T13:24:35Z",
+    "commit": "7ce4a08fdc62bcf3858791688886bd1e04fd1190",
+    "indexed_at": "2026-09-20T14:45:27Z",
     "project": "home-himwong-Desktop-depth_refine",
-    "nodes": 189,
-    "edges": 663,
-    "original_size": 2424832,
-    "compressed_size": 348595,
+    "nodes": 346,
+    "edges": 1353,
+    "original_size": 3407872,
+    "compressed_size": 494340,
     "compression_level": 3
 }

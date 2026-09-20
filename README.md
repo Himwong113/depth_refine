@@ -25,7 +25,37 @@ See [RGB and calibrated-ToF alignment](docs/tof_rgb_alignment.md) for the
 coordinate equations, an example, augmentation rules, and implementation
 details.
 
-## Model
+## Teacher/student v4
+
+The research path is now implemented as two explicit architectures:
+
+- `teacher_v4`: a frozen, externally pretrained Depth Anything V2 Large RGB
+  backbone plus trainable ZJU-L5 ToF fusion and metric-depth decoder;
+- `student_v4`: a deployable 141,694-parameter network with internal 320×240
+  RGB processing, fusion at 1/16 and 1/8, and a narrow full-resolution head.
+
+Both fusion blocks pool RGB appearance inside each calibrated ToF footprint.
+One attention head is geometry-biased and one remains global in the student;
+the teacher uses two of each. Invalid sensor values are masked and every block
+has a learnable null token. The deployment API is:
+
+```python
+depth = student(image, tof_tokens)
+output = student(image, tof_tokens, return_aux=True)  # training only
+```
+
+The legacy three-input call remains accepted. At 640×480, the student has
+approximately 0.353G MACs (convolution, linear, and attention). On the local
+RTX 4070 Ti implementation check it used 68.5 MiB peak allocated memory and
+4.34 ms p95; phone latency still needs measurement on the intended runtime and
+device.
+
+The implementation and experiment sequence are described in
+[the teacher/student research plan](docs/teacher_student_architecture_plan.md).
+
+![RGB–ToF teacher–student architecture](docs/depth_refinement_architecture.png)
+
+## Legacy baseline (attention_v3)
 
 Each valid ToF zone is retained as one compact conditioning token containing:
 
@@ -41,8 +71,6 @@ bias favors rectangles near each query without forbidding global context. A
 single decoder uses additive RGB skip connections, and the full-resolution head
 never receives the rectangular ToF raster. This prevents calibrated zone
 boundaries from being copied directly into the prediction.
-
-![Lightweight calibrated-ToF architecture](docs/depth_refinement_architecture.png)
 
 Regenerate the PNG and editable SVG with `python draw_architecture.py`.
 
@@ -73,6 +101,10 @@ anchor and visualization.
     cd /home/himwong/Desktop/depth_refine
     source .venv/bin/activate
     python -m pip install -r requirements.txt
+
+Teacher training additionally requires the lazy, non-deployment dependency:
+
+    python -m pip install -r requirements-teacher.txt
 
 Inspect the configuration, parameter count, and one real batch:
 
@@ -132,15 +164,175 @@ Resume a lightweight checkpoint by setting a larger total epoch count:
 
     python train.py --resume checkpoints_attention_v3/depth_refinement_epoch_005.pt --epochs 60
 
+### Teacher/student training workflow
+
+Training has two sequential stages. The teacher must finish first because its
+best checkpoint supplies the online supervision used to train the student:
+
+```text
+configs/teacher_v4.yml
+  → train teacher
+  → checkpoints_teacher_v4/best.pt
+  → load and freeze teacher while training student
+  → checkpoints_student_v4/best.pt
+```
+
+#### Stage A: train the teacher
+
+Install the optional teacher dependency and start training:
+
+```bash
+python -m pip install -r requirements-teacher.txt
+python train.py --config configs/teacher_v4.yml
+```
+
+The teacher configuration activates the teacher in two places:
+
+```yaml
+model:
+  architecture: teacher_v4
+training:
+  objective: teacher_v4
+```
+
+`architecture: teacher_v4` constructs `RGBToFTeacher`. The Depth Anything V2
+Large backbone and neck are kept in evaluation mode, have gradients disabled,
+and execute under `torch.no_grad()`. Its lightweight channel projections, the
+ToF fusion modules, decoder, and metric-depth head remain trainable.
+
+Stage A runs for 30 epochs with metric MSE plus a 0.1-weighted multi-scale
+log-depth gradient loss. Corrected validation RMSE selects
+`checkpoints_teacher_v4/best.pt`. TensorBoard events are written to
+`runs/teacher_v4`:
+
+```bash
+tensorboard --logdir runs/teacher_v4
+```
+
+Resume an interrupted run with the same configuration and a saved epoch:
+
+```bash
+python train.py \
+  --config configs/teacher_v4.yml \
+  --resume checkpoints_teacher_v4/depth_refinement_epoch_010.pt \
+  --epochs 30
+```
+
+Evaluate on validation data before beginning student training:
+
+```bash
+python eval.py \
+  --config configs/teacher_v4.yml \
+  --checkpoint checkpoints_teacher_v4/best.pt \
+  --split val
+```
+
+#### Stage B: train the student
+
+After the teacher checkpoint exists, start student distillation:
+
+```bash
+python train.py --config configs/student_v4.yml
+```
+
+The student configuration activates the deployable model and separately
+describes the frozen teacher:
+
+```yaml
+model:
+  architecture: student_v4
+training:
+  objective: student_distillation_v4
+  distillation:
+    teacher_checkpoint: checkpoints_teacher_v4/best.pt
+    teacher_model:
+      architecture: teacher_v4
+```
+
+The top-level model is the trainable student. At startup, `train.py` constructs
+a separate teacher from `distillation.teacher_model`, strictly restores
+`teacher_checkpoint`, freezes every teacher parameter, and keeps it in
+evaluation mode. The teacher runs online under `torch.no_grad()` so image
+augmentation and flipped ToF geometry remain aligned. Training-only 1×1
+feature adapters are optimized with the student but are not registered inside
+the deployable student model.
+
+Student Stage B runs for 60 epochs:
+
+- Epochs 1–5 use ground-truth losses only and do not execute the teacher.
+- Epochs 6–9 linearly ramp teacher supervision.
+- Epoch 10 onward uses the full teacher-depth and feature losses.
+
+Pixels outside valid ToF footprints receive 2× initial supervision weight.
+Teacher confidence is `exp(-|teacher-target| / 0.25)` and is applied only where
+ground truth is valid. Checkpoints are written to `checkpoints_student_v4`, and
+TensorBoard events are written to `runs/student_v4`:
+
+```bash
+tensorboard --logdir runs/student_v4
+```
+
+Resume student training with:
+
+```bash
+python train.py \
+  --config configs/student_v4.yml \
+  --resume checkpoints_student_v4/depth_refinement_epoch_020.pt \
+  --epochs 60
+```
+
+The Depth Anything weights are external pretrained initialization; ZJU-L5 is
+the only dataset used for task-specific teacher and student optimization.
+
 ## Evaluation
 
 Evaluate the best checkpoint on the held-out test scenes:
 
     python eval.py --checkpoint checkpoints_attention_v3/best.pt
 
-The evaluator reports masked MAE, total RMSE, and the four depth-bin RMSE
-values. Save RGB, calibrated ToF, prediction, and ground-truth panels with:
+Evaluate the v4 teacher or student by supplying the matching configuration and
+checkpoint. Use the validation split during development and reserve the test
+split for final reporting:
+
+```bash
+python eval.py \
+  --config configs/teacher_v4.yml \
+  --checkpoint checkpoints_teacher_v4/best.pt \
+  --split val
+
+python eval.py \
+  --config configs/student_v4.yml \
+  --checkpoint checkpoints_student_v4/best.pt \
+  --split test
+```
+
+Evaluation constructs only the architecture selected by the top-level
+`model.architecture`. Student evaluation therefore loads only student weights;
+it does not instantiate the teacher or the training-only feature adapters.
+
+The evaluator reports pooled and image-averaged RMSE, MAE, AbsRel, and δ1,
+plus the same pooled metrics for each depth bin and for pixels inside/outside
+valid ToF coverage. Boundary accuracy is the fraction of valid target
+discontinuity pairs above 0.1 m whose predicted discontinuity is also above
+0.1 m. Values outside `[min_depth, max_depth]` are excluded. The old
+clamp-to-range behavior is available only by setting
+`legacy_clamp_out_of_range: true`, and those results must be labeled as legacy.
+Save RGB, calibrated ToF, prediction, and ground-truth panels with:
 
     python eval.py --checkpoint checkpoints_attention_v3/best.pt --visualize
 
-All model, data, training, and evaluation settings are in config.yml.
+The legacy baseline remains in `config.yml`; v4 settings are in `configs/`.
+
+## Student export
+
+Export a fixed 480×640 TorchScript graph after student training. The exporter
+strictly loads only student weights and checks PyTorch/TorchScript parity before
+writing the artifact:
+
+    python export_student.py \
+      --config configs/student_v4.yml \
+      --checkpoint checkpoints_student_v4/best.pt \
+      --output student_v4_480x640.pt
+
+The training-only teacher and feature adapters are not registered inside the
+student and therefore cannot enter the exported graph.

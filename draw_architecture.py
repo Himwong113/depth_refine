@@ -1,4 +1,4 @@
-"""Render the lightweight calibrated-ToF architecture diagram."""
+"""Render the RGB–ToF teacher/student architecture diagram."""
 
 from __future__ import annotations
 
@@ -24,6 +24,10 @@ DEC = "#ffedd5"
 DEC_EDGE = "#ea580c"
 HEAD = "#f3e8ff"
 HEAD_EDGE = "#9333ea"
+FROZEN = "#e2e8f0"
+FROZEN_EDGE = "#475569"
+LOSS = "#fce7f3"
+LOSS_EDGE = "#db2777"
 
 
 def box(
@@ -108,182 +112,273 @@ def arrow(axis, start, end, color=INK, dashed=False, curve=0.0):
 
 def render() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    figure, axis = plt.subplots(figsize=(18, 8), facecolor="white")
+    figure, axis = plt.subplots(figsize=(18, 10), facecolor="white")
     axis.set_xlim(0, 18)
-    axis.set_ylim(0, 8)
+    axis.set_ylim(0, 10)
     axis.axis("off")
 
     axis.text(
-        0.5,
-        7.55,
-        "Lightweight calibrated-ToF depth refinement",
+        0.45,
+        9.55,
+        "RGB–ToF teacher–student metric-depth refinement",
         fontsize=18,
         fontweight="bold",
         color=INK,
     )
     axis.text(
-        0.5,
-        7.18,
-        "125.9K parameters • ~1.40G convolution/attention MACs at 640×480 "
-        "• geometric cross-attention",
+        0.45,
+        9.18,
+        "Stage A learns a strong frozen-backbone teacher • Stage B distills to "
+        "a 141.7K-parameter mobile student • only the student deploys",
         fontsize=9,
         color=MUTED,
     )
 
-    rgb = box(axis, 0.55, 5.55, 1.8, 1.0, "RGB", "3 × H × W", RGB, RGB_EDGE)
-    tof = box(
-        axis,
-        0.55,
-        3.65,
-        1.8,
-        1.25,
-        "Raw ToF",
-        "mean + std + mask + fr\n64 calibrated zones",
-        TOF,
-        TOF_EDGE,
+    teacher_band = FancyBboxPatch(
+        (2.65, 5.72),
+        14.75,
+        2.75,
+        boxstyle="round,pad=0.04,rounding_size=0.12",
+        linewidth=1.0,
+        edgecolor="#bfdbfe",
+        facecolor="#f8fbff",
+        zorder=-2,
     )
-    raster = box(
-        axis,
+    student_band = FancyBboxPatch(
+        (2.65, 0.88),
+        14.75,
+        2.75,
+        boxstyle="round,pad=0.04,rounding_size=0.12",
+        linewidth=1.0,
+        edgecolor="#c7d2fe",
+        facecolor="#fafaff",
+        zorder=-2,
+    )
+    axis.add_patch(teacher_band)
+    axis.add_patch(student_band)
+    axis.text(
         2.9,
-        3.65,
-        2.2,
-        1.25,
-        "ToF tokens",
-        "mean/std/valid/box\n64 × 7",
-        TOF,
-        TOF_EDGE,
+        8.18,
+        "STAGE A — TRAIN TEACHER",
+        fontsize=8.5,
+        fontweight="bold",
+        color=RGB_EDGE,
     )
-    fusion = box(
-        axis,
-        5.65,
-        4.6,
-        2.0,
-        1.25,
-        "RGB stem",
-        "RGB only • 1/2",
-        RGB,
-        RGB_EDGE,
+    axis.text(
+        2.9,
+        3.34,
+        "STAGE B — DISTILL INTO STUDENT",
+        fontsize=8.5,
+        fontweight="bold",
+        color=ENC_EDGE,
     )
 
-    e1 = box(axis, 8.15, 5.0, 1.6, 1.05, "Encoder 1", "32 ch • 1/2", ENC, ENC_EDGE)
-    e2 = box(axis, 10.15, 5.0, 1.6, 1.05, "Encoder 2", "64 ch • 1/4", ENC, ENC_EDGE)
-    e3 = box(axis, 12.15, 5.0, 1.6, 1.05, "Encoder 3", "96 ch • 1/8", ENC, ENC_EDGE)
-    e4 = box(
+    rgb = box(axis, 0.4, 7.05, 1.65, 0.95, "RGB", "3 × 480 × 640", RGB, RGB_EDGE)
+    tof = box(
         axis,
-        14.15,
-        5.0,
-        1.8,
+        0.4,
+        5.62,
+        1.65,
         1.05,
-        "RGB Encoder 4",
-        "128 ch • 1/16",
+        "Calibrated ToF",
+        "64 × 7 tokens\nmean/std/valid/box",
+        TOF,
+        TOF_EDGE,
+    )
+    target = box(
+        axis,
+        0.4,
+        4.15,
+        1.65,
+        0.95,
+        "Ground truth",
+        "valid metric depth",
+        HEAD,
+        HEAD_EDGE,
+    )
+
+    teacher_rgb = box(
+        axis,
+        3.0,
+        6.43,
+        2.15,
+        1.15,
+        "Depth Anything V2-L",
+        "frozen backbone + neck\nno gradients • eval mode",
+        FROZEN,
+        FROZEN_EDGE,
+    )
+    teacher_pyramid = box(
+        axis,
+        5.75,
+        6.43,
+        2.05,
+        1.15,
+        "Trainable pyramid",
+        "64/96/128/192 ch\n1/2 • 1/4 • 1/8 • 1/16",
         ENC,
         ENC_EDGE,
     )
-    tof_attention = box(
+    teacher_fusion = box(
         axis,
-        16.2,
-        5.0,
-        1.35,
-        1.05,
-        "Cross-attn",
-        "2 heads × 8D\nsoft geometry",
+        8.4,
+        6.43,
+        2.15,
+        1.15,
+        "Teacher ToF fusion",
+        "footprint appearance\n4 heads • 1/16 + 1/8",
         TOF,
         TOF_EDGE,
     )
-
-    d3 = box(axis, 13.95, 2.75, 1.8, 1.05, "Decoder 3", "96 ch • 1/8", DEC, DEC_EDGE)
-    d2 = box(axis, 11.6, 2.75, 1.8, 1.05, "Decoder 2", "64 ch • 1/4", DEC, DEC_EDGE)
-    d1 = box(axis, 9.25, 2.75, 1.8, 1.05, "Decoder 1", "32 ch • 1/2", DEC, DEC_EDGE)
-    refine = box(
+    teacher_decoder = box(
         axis,
-        6.55,
+        11.15,
+        6.43,
+        2.15,
         1.15,
-        2.1,
-        1.15,
-        "Full-res refine",
-        "separable convolution\n+ RGB skip",
+        "Teacher decoder",
+        "additive RGB skips\n16-ch full-res refine",
         DEC,
         DEC_EDGE,
     )
-    heads = box(
+    teacher_output = box(
         axis,
-        3.65,
+        13.9,
+        6.43,
+        2.95,
         1.15,
-        2.25,
-        1.15,
-        "Residual + scale",
-        "learned dense residual\n+ global ToF mean",
-        HEAD,
-        HEAD_EDGE,
-    )
-    output = box(
-        axis,
-        0.65,
-        1.15,
-        2.25,
-        1.15,
-        "Dense metric depth",
-        "1 × H × W",
+        "Teacher metric depth + features",
+        "640 × 480 depth\nfused features at 1/8 + 1/16",
         HEAD,
         HEAD_EDGE,
     )
 
-    arrow(axis, center_right(tof), center_left(raster), TOF_EDGE)
-    arrow(axis, center_right(rgb), center_left(fusion), RGB_EDGE, curve=0.08)
-    arrow(axis, center_right(fusion), center_left(e1), RGB_EDGE)
-    arrow(axis, center_right(e1), center_left(e2), ENC_EDGE)
-    arrow(axis, center_right(e2), center_left(e3), ENC_EDGE)
-    arrow(axis, center_right(e3), center_left(e4), ENC_EDGE)
-    arrow(axis, center_right(e4), center_left(tof_attention), ENC_EDGE)
-    arrow(axis, center_bottom(tof_attention), center_top(d3), DEC_EDGE, curve=0.08)
-    arrow(axis, center_left(d3), center_right(d2), DEC_EDGE)
-    arrow(axis, center_left(d2), center_right(d1), DEC_EDGE)
-    arrow(axis, center_bottom(d1), center_top(refine), DEC_EDGE, curve=0.1)
-    arrow(axis, center_left(refine), center_right(heads), HEAD_EDGE)
-    arrow(axis, center_left(heads), center_right(output), HEAD_EDGE)
-
-    arrow(axis, center_bottom(e3), center_top(d3), ENC_EDGE, dashed=True)
-    arrow(axis, center_bottom(e2), center_top(d2), ENC_EDGE, dashed=True)
-    arrow(axis, center_bottom(e1), center_top(d1), ENC_EDGE, dashed=True)
-    arrow(
+    distillation = box(
         axis,
-        center_bottom(fusion),
-        center_top(refine),
+        11.55,
+        4.18,
+        3.1,
+        1.05,
+        "Coverage-aware objectives",
+        "GT MSE + gradients • teacher depth\nfeature cosine • 2× outside ToF",
+        LOSS,
+        LOSS_EDGE,
+    )
+
+    student_rgb = box(
+        axis,
+        3.0,
+        1.58,
+        2.15,
+        1.15,
+        "Mobile RGB encoder",
+        "internal 320 × 240\n32/64/96/128 ch",
+        RGB,
         RGB_EDGE,
+    )
+    student_fusion = box(
+        axis,
+        5.75,
+        1.58,
+        2.05,
+        1.15,
+        "Student ToF fusion",
+        "footprint appearance\n2 heads • 1/16 + 1/8",
+        TOF,
+        TOF_EDGE,
+    )
+    student_decoder = box(
+        axis,
+        8.4,
+        1.58,
+        2.15,
+        1.15,
+        "Lightweight decoder",
+        "additive skips\ndecode only to 1/4",
+        DEC,
+        DEC_EDGE,
+    )
+    student_head = box(
+        axis,
+        11.15,
+        1.58,
+        2.15,
+        1.15,
+        "Full-resolution head",
+        "8-ch projection + RGB\npositive residual + ToF anchor",
+        DEC,
+        DEC_EDGE,
+    )
+    student_output = box(
+        axis,
+        13.9,
+        1.58,
+        2.95,
+        1.15,
+        "Deployed metric depth",
+        "1 × 480 × 640\nteacher-free single pass",
+        HEAD,
+        HEAD_EDGE,
+    )
+
+    arrow(axis, center_right(rgb), center_left(teacher_rgb), RGB_EDGE)
+    arrow(axis, center_right(teacher_rgb), center_left(teacher_pyramid), FROZEN_EDGE)
+    arrow(axis, center_right(teacher_pyramid), center_left(teacher_fusion), ENC_EDGE)
+    arrow(axis, center_right(teacher_fusion), center_left(teacher_decoder), TOF_EDGE)
+    arrow(axis, center_right(teacher_decoder), center_left(teacher_output), DEC_EDGE)
+
+    arrow(axis, center_right(rgb), center_left(student_rgb), RGB_EDGE, curve=0.32)
+    arrow(axis, center_right(student_rgb), center_left(student_fusion), RGB_EDGE)
+    arrow(axis, center_right(student_fusion), center_left(student_decoder), TOF_EDGE)
+    arrow(axis, center_right(student_decoder), center_left(student_head), DEC_EDGE)
+    arrow(axis, center_right(student_head), center_left(student_output), HEAD_EDGE)
+
+    arrow(axis, center_right(tof), center_left(teacher_fusion), TOF_EDGE, curve=0.3)
+    arrow(axis, center_right(tof), center_left(student_fusion), TOF_EDGE, curve=0.22)
+    arrow(
+        axis,
+        center_bottom(teacher_output),
+        center_top(distillation),
+        LOSS_EDGE,
         dashed=True,
-        curve=0.18,
+        curve=0.12,
     )
     arrow(
         axis,
-        center_right(raster),
-        center_left(tof_attention),
-        TOF_EDGE,
+        center_right(target),
+        center_left(distillation),
+        LOSS_EDGE,
         dashed=True,
-        curve=-0.18,
+        curve=-0.06,
     )
     arrow(
         axis,
-        center_bottom(raster),
-        center_top(heads),
-        TOF_EDGE,
+        center_top(student_head),
+        center_bottom(distillation),
+        LOSS_EDGE,
         dashed=True,
-        curve=-0.22,
+        curve=-0.12,
     )
 
     axis.text(
-        9.1,
-        0.45,
-        "Solid: feature flow   •   Dashed: RGB skips, ToF token conditioning, "
-        "and global scale only",
+        9.0,
+        0.38,
+        "Solid: inference feature flow   •   Dashed magenta: training-only "
+        "supervision   •   teacher and adapters are absent from deployment",
         ha="center",
         fontsize=8,
         color=MUTED,
     )
 
+    svg_path = OUTPUT_DIR / "depth_refinement_architecture.svg"
     figure.savefig(
-        OUTPUT_DIR / "depth_refinement_architecture.svg",
+        svg_path,
         bbox_inches="tight",
         facecolor="white",
+    )
+    svg_path.write_text(
+        "\n".join(line.rstrip() for line in svg_path.read_text().splitlines()) + "\n",
+        encoding="utf-8",
     )
     figure.savefig(
         OUTPUT_DIR / "depth_refinement_architecture.png",

@@ -29,6 +29,16 @@ def load_checkpoint(
         weights_only=False,
     )
     if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        checkpoint_architecture = checkpoint.get("architecture")
+        model_architecture = getattr(model, "architecture", "attention_v3")
+        if (
+            checkpoint_architecture is not None
+            and checkpoint_architecture != model_architecture
+        ):
+            raise ValueError(
+                f"checkpoint architecture {checkpoint_architecture!r} does not "
+                f"match configured model {model_architecture!r}"
+            )
         model.load_state_dict(checkpoint["model_state_dict"], strict=True)
         epoch = checkpoint.get("epoch")
         return int(epoch) if epoch is not None else None
@@ -70,7 +80,7 @@ def main() -> None:
     evaluation_options = config.get("evaluation", {})
 
     device = resolve_device(arguments.device or evaluation_options.get("device", "auto"))
-    model = build_model(config).to(device=device, dtype=torch.float32)
+    model = build_model(config).to(device=device)
     epoch = load_checkpoint(model, arguments.checkpoint, device)
 
     data_options = dict(config["data"])
@@ -116,16 +126,40 @@ def main() -> None:
         print(f"Checkpoint epoch: {epoch}")
     print(f"Device: {device}")
     print(f"Split: {data_options['split']} ({len(data_loader.dataset):,} samples)")
-    print(f"Masked MAE:  {metrics['mae']:.6f} m")
-    print(f"Masked RMSE: {metrics['rmse']:.6f} m")
-    for label, key in (
-        ("0–2 m", "rmse_0_2m"),
-        ("2–4 m", "rmse_2_4m"),
-        ("4–6 m", "rmse_4_6m"),
-        ("6+ m", "rmse_6_infm"),
-    ):
-        if key in metrics:
-            print(f"RMSE {label:>5}: {metrics[key]:.6f} m")
+    print("Region             RMSE (m)   MAE (m)    AbsRel      δ1")
+    print("-----------------  ---------  ---------  ----------  ----------")
+    metric_groups = (
+        ("pooled", ""),
+        ("image averaged", "image_"),
+        ("inside ToF", "inside_tof"),
+        ("outside ToF", "outside_tof"),
+        ("0–2 m", "0_2m"),
+        ("2–4 m", "2_4m"),
+        ("4–6 m", "4_6m"),
+        ("6+ m", "6_infm"),
+    )
+    for label, suffix in metric_groups:
+        if suffix == "image_":
+            keys = tuple(
+                f"image_{name}" for name in ("rmse", "mae", "abs_rel", "delta1")
+            )
+        elif suffix:
+            keys = tuple(
+                f"{name}_{suffix}" for name in ("rmse", "mae", "abs_rel", "delta1")
+            )
+        else:
+            keys = ("rmse", "mae", "abs_rel", "delta1")
+        if all(key in metrics for key in keys):
+            print(
+                f"{label:<17}  {metrics[keys[0]]:9.6f}  "
+                f"{metrics[keys[1]]:9.6f}  {metrics[keys[2]]:10.6f}  "
+                f"{metrics[keys[3]]:10.6f}"
+            )
+    if "boundary_accuracy" in metrics:
+        print(
+            "Boundary accuracy (GT discontinuity recall at 0.1 m): "
+            f"{metrics['boundary_accuracy']:.6f}"
+        )
     if visualizer is not None:
         print(
             f"Visualizations: {visualizer.saved_images} saved to "

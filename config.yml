@@ -1,5 +1,7 @@
 # Lightweight calibrated-ToF depth refinement configuration
 model:
+  # Explicit legacy selection keeps existing attention-v3 checkpoints usable.
+  architecture: attention_v3
   image_channels: 3
   # Encoder widths are base, 2×base, 3×base, and 4×base. The default stays
   # well below one million parameters.
@@ -34,9 +36,10 @@ data:
   image_mean: [0.485, 0.456, 0.406]
   image_std: [0.229, 0.224, 0.225]
 
-  # Clamp valid high-resolution ground-truth depth to this metric range.
+  # Ground truth outside this range is excluded, never clamped into-range.
   min_depth: 0.1
   max_depth: 10.0
+  legacy_clamp_out_of_range: false
 
   # Geometry-preserving training augmentation. RGB, calibrated ToF, and target
   # are flipped together.

@@ -6,6 +6,8 @@ import argparse
 from pathlib import Path
 import warnings
 
+import torch
+
 from data import build_zjul5_dataloader, get_zjul5_manifest_splits
 from main import (
     DEFAULT_CONFIG_PATH,
@@ -15,6 +17,36 @@ from main import (
     print_model_summary,
 )
 from training import train_model
+
+
+def _build_distillation_teacher(training_options: dict) -> torch.nn.Module | None:
+    """Build and strictly restore the frozen Stage-A teacher when requested."""
+
+    if training_options.get("objective", "legacy") != "student_distillation_v4":
+        return None
+    distillation_options = training_options.get("distillation", {})
+    teacher_options = distillation_options.get("teacher_model")
+    checkpoint_value = distillation_options.get("teacher_checkpoint")
+    if not isinstance(teacher_options, dict) or checkpoint_value is None:
+        raise ValueError(
+            "student distillation requires distillation.teacher_model and "
+            "distillation.teacher_checkpoint"
+        )
+    teacher = build_model({"model": teacher_options})
+    checkpoint_path = Path(checkpoint_value).expanduser()
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"teacher checkpoint not found: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    state = checkpoint.get("model_state_dict", checkpoint)
+    if not isinstance(state, dict):
+        raise ValueError("teacher checkpoint has no model state dictionary")
+    checkpoint_architecture = checkpoint.get("architecture")
+    if checkpoint_architecture not in {None, "teacher_v4"}:
+        raise ValueError(
+            f"expected a teacher_v4 checkpoint, got {checkpoint_architecture!r}"
+        )
+    teacher.load_state_dict(state, strict=True)
+    return teacher
 
 
 def _resolve_validation_split(
@@ -110,12 +142,15 @@ def main() -> None:
             raise ValueError("--epochs must be positive")
         training_options["epochs"] = arguments.epochs
 
+    teacher_model = _build_distillation_teacher(training_options)
+
     train_model(
         model,
         train_loader,
         validation_loader,
         training_options,
         training_data_options,
+        teacher_model,
     )
 
 

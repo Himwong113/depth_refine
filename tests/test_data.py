@@ -13,6 +13,43 @@ from data import ZJUL5Dataset, build_calibrated_tof_tokens, rasterize_calibrated
 
 
 class CalibratedToFRasterizationTests(unittest.TestCase):
+    def test_out_of_range_ground_truth_is_excluded_not_clamped(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            sample_path = root / "sample.h5"
+            rgb = np.zeros((8, 10, 3), dtype=np.uint8)
+            depth = np.ones((8, 10), dtype=np.float32)
+            depth[0, :5] = np.array([0.05, 0.1, 10.0, 12.0, np.nan])
+            hist_data = np.zeros((64, 2), dtype=np.float32)
+            rect_data = np.zeros((64, 4), dtype=np.int32)
+            mask = np.zeros(64, dtype=np.bool_)
+            with h5py.File(sample_path, "w") as sample_file:
+                sample_file["rgb"] = rgb
+                sample_file["depth"] = depth
+                sample_file["hist_data"] = hist_data
+                sample_file["fr"] = rect_data
+                sample_file["mask"] = mask
+            (root / "data.json").write_text(
+                json.dumps({"train": [{"filename": sample_path.name}]}),
+                encoding="utf-8",
+            )
+            sample = ZJUL5Dataset(
+                root,
+                split="train",
+                normalize_image=False,
+                min_depth=0.1,
+                max_depth=10.0,
+            )[0]
+
+        self.assertEqual(
+            sample["target_valid_mask"][0, 0, :5].tolist(),
+            [False, True, True, False, False],
+        )
+        torch.testing.assert_close(
+            sample["target_depth"][0, 0, :5],
+            torch.tensor([0.0, 0.1, 10.0, 0.0, 0.0]),
+        )
+
     def test_rectangles_are_clipped_and_invalid_zones_stay_empty(self) -> None:
         hist_data = np.zeros((64, 2), dtype=np.float32)
         rect_data = np.zeros((64, 4), dtype=np.int32)

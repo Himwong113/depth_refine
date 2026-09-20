@@ -1,6 +1,6 @@
 """PyTorch models for RGB-guided depth refinement."""
 
-from .model import (
+from .legacy import (
     ConvNormAct,
     DepthRefineNet,
     DepthRefinementModel,
@@ -9,6 +9,9 @@ from .model import (
     GeometryAwareToFAttention,
     LiteDecoderBlock,
 )
+from .model import DepthOutput, MobileDepthStudent
+from .teacher import RGBToFTeacher
+from .tof import FootprintAwareToFAttention, tof_coverage_mask
 
 __all__ = [
     "ConvNormAct",
@@ -18,4 +21,9 @@ __all__ = [
     "DepthwiseSeparableBlock",
     "GeometryAwareToFAttention",
     "LiteDecoderBlock",
+    "DepthOutput",
+    "FootprintAwareToFAttention",
+    "MobileDepthStudent",
+    "RGBToFTeacher",
+    "tof_coverage_mask",
 ]
