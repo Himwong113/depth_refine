@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import warnings
 from collections.abc import Callable
+from itertools import chain
 from pathlib import Path
 from typing import Any
 
@@ -11,9 +12,21 @@ import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
 
-from visualization import create_depth_comparison_figure
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except ImportError:  # pragma: no cover - depends on optional runtime package
+    SummaryWriter = None  # type: ignore[assignment,misc]
+
+from distillation import (
+    FeatureDistillationAdapters,
+    distillation_ramp,
+    student_distillation_loss,
+    student_ground_truth_loss,
+    teacher_supervision_loss,
+)
+from model.outputs import DepthOutput
+from model.tof import tof_coverage_mask
 
 
 def resolve_device(requested_device: str) -> torch.device:
@@ -41,7 +54,7 @@ class _TensorBoardSampleLogger:
 
     def __init__(
         self,
-        writer: SummaryWriter,
+        writer: Any,
         epoch: int,
         max_images: int,
         split_name: str,
@@ -68,6 +81,8 @@ class _TensorBoardSampleLogger:
         batch_index: int,
     ) -> None:
         del batch_index
+        from visualization import create_depth_comparison_figure
+
         for sample_index in range(prediction.shape[0]):
             if self.logged_images >= self.max_images:
                 return
@@ -148,6 +163,77 @@ def masked_depth_loss(
     )
 
 
+def forward_depth_model(
+    model: nn.Module,
+    image: Tensor,
+    tof_features: Tensor,
+    tof_tokens: Tensor | None,
+    return_aux: bool = False,
+) -> Tensor | DepthOutput:
+    """Call either the legacy three-input model or a v4 token-only model."""
+
+    if bool(getattr(model, "uses_tof_tokens_only", False)):
+        if tof_tokens is None:
+            raise ValueError(f"{model.__class__.__name__} requires calibrated ToF tokens")
+        return model(image, tof_tokens, return_aux=return_aux)
+    if return_aux:
+        raise ValueError("auxiliary features are unavailable for attention_v3")
+    return (
+        model(image, tof_features)
+        if tof_tokens is None
+        else model(image, tof_features, tof_tokens)
+    )
+
+
+def _empty_depth_metric_totals() -> dict[str, float]:
+    return {
+        "absolute_error": 0.0,
+        "squared_error": 0.0,
+        "absolute_relative_error": 0.0,
+        "delta1_count": 0.0,
+        "pixel_count": 0.0,
+    }
+
+
+def _accumulate_depth_metrics(
+    totals: dict[str, float],
+    prediction: Tensor,
+    target: Tensor,
+    mask: Tensor,
+) -> None:
+    """Add pooled metric sufficient statistics for the selected pixels."""
+
+    count = int(mask.sum().item())
+    if count == 0:
+        return
+    selected_prediction = prediction[mask].float()
+    selected_target = target[mask].float()
+    error = selected_prediction - selected_target
+    totals["absolute_error"] += error.abs().sum().item()
+    totals["squared_error"] += error.square().sum().item()
+    totals["absolute_relative_error"] += (
+        error.abs() / selected_target.clamp_min(1e-6)
+    ).sum().item()
+    ratio = torch.maximum(
+        selected_prediction.clamp_min(1e-6) / selected_target,
+        selected_target / selected_prediction.clamp_min(1e-6),
+    )
+    totals["delta1_count"] += (ratio < 1.25).sum().item()
+    totals["pixel_count"] += count
+
+
+def _finalize_depth_metrics(totals: dict[str, float]) -> dict[str, float]:
+    count = totals["pixel_count"]
+    if count == 0:
+        return {}
+    return {
+        "mae": totals["absolute_error"] / count,
+        "rmse": (totals["squared_error"] / count) ** 0.5,
+        "abs_rel": totals["absolute_relative_error"] / count,
+        "delta1": totals["delta1_count"] / count,
+    }
+
+
 def evaluate(
     model: nn.Module,
     data_loader: DataLoader,
@@ -156,17 +242,23 @@ def evaluate(
     prediction_callback: Callable[[dict[str, Any], Tensor, int], None] | None = None,
     loss_config: dict[str, Any] | None = None,
 ) -> dict[str, float]:
-    """Evaluate masked loss, MAE, and RMSE on a DataLoader."""
+    """Evaluate corrected pooled, image-averaged, and coverage-aware metrics."""
 
     model.eval()
-    absolute_error_sum = 0.0
-    squared_error_sum = 0.0
-    valid_pixel_count = 0
+    overall_totals = _empty_depth_metric_totals()
+    image_metrics = {
+        metric: [] for metric in ("mae", "rmse", "abs_rel", "delta1")
+    }
     loss_sum = 0.0
     completed_batches = 0
     depth_bins = ((0.0, 2.0), (2.0, 4.0), (4.0, 6.0), (6.0, float("inf")))
-    bin_squared_error = {bounds: 0.0 for bounds in depth_bins}
-    bin_pixel_count = {bounds: 0 for bounds in depth_bins}
+    bin_totals = {bounds: _empty_depth_metric_totals() for bounds in depth_bins}
+    coverage_totals = {
+        label: _empty_depth_metric_totals() for label in ("inside", "outside")
+    }
+    boundary_totals = _empty_depth_metric_totals()
+    boundary_correct_count = 0
+    boundary_pair_count = 0
 
     with torch.inference_mode():
         for batch_index, batch in enumerate(data_loader):
@@ -182,11 +274,11 @@ def evaluate(
             target = batch["target_depth"].to(device, non_blocking=True)
             valid_mask = batch["target_valid_mask"].to(device, non_blocking=True).bool()
 
-            prediction = (
-                model(image, tof_features)
-                if tof_tokens is None
-                else model(image, tof_features, tof_tokens)
+            prediction = forward_depth_model(
+                model, image, tof_features, tof_tokens, return_aux=False
             )
+            if not isinstance(prediction, Tensor):
+                prediction = prediction.depth
             if prediction_callback is not None:
                 prediction_callback(batch, prediction, batch_index)
             if loss_config is not None:
@@ -201,32 +293,102 @@ def evaluate(
                     float(loss_config.get("minimum_depth", 1e-3)),
                 ).item()
             completed_batches += 1
-            valid_mask &= torch.isfinite(prediction) & torch.isfinite(target)
-            error = prediction[valid_mask] - target[valid_mask]
-            valid_targets = target[valid_mask]
-            absolute_error_sum += error.abs().sum().item()
-            squared_error_sum += error.square().sum().item()
-            valid_pixel_count += error.numel()
+            valid_mask &= torch.isfinite(target) & (target > 0)
+            if not torch.isfinite(prediction[valid_mask]).all():
+                raise FloatingPointError(
+                    "prediction contains non-finite values at valid target pixels"
+                )
+            _accumulate_depth_metrics(overall_totals, prediction, target, valid_mask)
+            for sample_index in range(prediction.shape[0]):
+                sample_valid = valid_mask[sample_index]
+                if torch.any(sample_valid):
+                    sample_totals = _empty_depth_metric_totals()
+                    _accumulate_depth_metrics(
+                        sample_totals,
+                        prediction[sample_index],
+                        target[sample_index],
+                        sample_valid,
+                    )
+                    for metric, value in _finalize_depth_metrics(sample_totals).items():
+                        image_metrics[metric].append(value)
             for lower, upper in depth_bins:
-                in_bin = (valid_targets >= lower) & (valid_targets < upper)
-                bin_squared_error[(lower, upper)] += error[in_bin].square().sum().item()
-                bin_pixel_count[(lower, upper)] += int(in_bin.sum().item())
+                in_bin = valid_mask & (target >= lower) & (target < upper)
+                _accumulate_depth_metrics(
+                    bin_totals[(lower, upper)], prediction, target, in_bin
+                )
 
-    if valid_pixel_count == 0:
+            if tof_tokens is not None:
+                coverage = tof_coverage_mask(tof_tokens, target.shape[-2:])
+                for label, region in (
+                    ("inside", coverage),
+                    ("outside", ~coverage),
+                ):
+                    region_valid = valid_mask & region
+                    _accumulate_depth_metrics(
+                        coverage_totals[label], prediction, target, region_valid
+                    )
+
+            edge_threshold = 0.1
+            boundary = torch.zeros_like(valid_mask)
+            horizontal_pair = valid_mask[..., 1:] & valid_mask[..., :-1]
+            horizontal_edge = (
+                (target[..., 1:] - target[..., :-1]).abs() > edge_threshold
+            ) & horizontal_pair
+            predicted_horizontal_edge = (
+                (prediction[..., 1:] - prediction[..., :-1]).abs() > edge_threshold
+            ) & horizontal_pair
+            boundary_correct_count += int(
+                (horizontal_edge & predicted_horizontal_edge).sum().item()
+            )
+            boundary_pair_count += int(horizontal_edge.sum().item())
+            boundary[..., 1:] |= horizontal_edge
+            boundary[..., :-1] |= horizontal_edge
+            vertical_pair = valid_mask[..., 1:, :] & valid_mask[..., :-1, :]
+            vertical_edge = (
+                (target[..., 1:, :] - target[..., :-1, :]).abs() > edge_threshold
+            ) & vertical_pair
+            predicted_vertical_edge = (
+                (prediction[..., 1:, :] - prediction[..., :-1, :]).abs()
+                > edge_threshold
+            ) & vertical_pair
+            boundary_correct_count += int(
+                (vertical_edge & predicted_vertical_edge).sum().item()
+            )
+            boundary_pair_count += int(vertical_edge.sum().item())
+            boundary[..., 1:, :] |= vertical_edge
+            boundary[..., :-1, :] |= vertical_edge
+            _accumulate_depth_metrics(boundary_totals, prediction, target, boundary)
+
+    metrics = _finalize_depth_metrics(overall_totals)
+    if not metrics:
         raise RuntimeError("validation produced no valid target-depth pixels")
-    metrics = {
-        "mae": absolute_error_sum / valid_pixel_count,
-        "rmse": (squared_error_sum / valid_pixel_count) ** 0.5,
-    }
+    metrics.update(
+        {
+            f"image_{metric}": sum(values) / len(values)
+            for metric, values in image_metrics.items()
+        }
+    )
     if loss_config is not None:
         metrics["loss"] = loss_sum / completed_batches
     for lower, upper in depth_bins:
-        count = bin_pixel_count[(lower, upper)]
-        if count:
-            upper_label = "inf" if upper == float("inf") else f"{upper:g}"
-            metrics[f"rmse_{lower:g}_{upper_label}m"] = (
-                bin_squared_error[(lower, upper)] / count
-            ) ** 0.5
+        upper_label = "inf" if upper == float("inf") else f"{upper:g}"
+        suffix = f"{lower:g}_{upper_label}m"
+        for metric, value in _finalize_depth_metrics(
+            bin_totals[(lower, upper)]
+        ).items():
+            metrics[f"{metric}_{suffix}"] = value
+    for label in ("inside", "outside"):
+        for metric, value in _finalize_depth_metrics(
+            coverage_totals[label]
+        ).items():
+            metrics[f"{metric}_{label}_tof"] = value
+    for metric, value in _finalize_depth_metrics(boundary_totals).items():
+        metrics[f"boundary_{metric}"] = value
+    if boundary_pair_count:
+        # Recall of target depth discontinuities at the same valid pixel pair.
+        metrics["boundary_accuracy"] = (
+            boundary_correct_count / boundary_pair_count
+        )
     return metrics
 
 
@@ -301,9 +463,11 @@ def _checkpoint_state(
     config: dict[str, Any],
     best_validation_rmse: float,
     best_epoch: int | None,
+    auxiliary_module: nn.Module | None = None,
 ) -> dict[str, Any]:
-    return {
+    state = {
         "epoch": epoch,
+        "architecture": getattr(model, "architecture", "attention_v3"),
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
@@ -312,6 +476,9 @@ def _checkpoint_state(
         "best_validation_rmse": best_validation_rmse,
         "best_epoch": best_epoch,
     }
+    if auxiliary_module is not None:
+        state["distillation_adapter_state_dict"] = auxiliary_module.state_dict()
+    return state
 
 
 def _load_resume_checkpoint(
@@ -321,6 +488,7 @@ def _load_resume_checkpoint(
     scheduler: torch.optim.lr_scheduler.LRScheduler | None,
     scaler: torch.amp.GradScaler,
     device: torch.device,
+    auxiliary_module: nn.Module | None = None,
 ) -> tuple[int, float, int | None]:
     """Restore training state and return next epoch and best-metric state."""
 
@@ -335,6 +503,13 @@ def _load_resume_checkpoint(
 
     initial_scheduler_lrs = [group["lr"] for group in optimizer.param_groups]
     model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+    if auxiliary_module is not None:
+        adapter_state = checkpoint.get("distillation_adapter_state_dict")
+        if adapter_state is None:
+            raise ValueError(
+                "distillation resume checkpoint has no adapter state dictionary"
+            )
+        auxiliary_module.load_state_dict(adapter_state, strict=True)
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     if "scaler_state_dict" in checkpoint:
         scaler.load_state_dict(checkpoint["scaler_state_dict"])
@@ -370,6 +545,7 @@ def train_model(
     validation_loader: DataLoader | None,
     config: dict[str, Any],
     data_config: dict[str, Any] | None = None,
+    teacher_model: nn.Module | None = None,
 ) -> None:
     """Train the model and periodically save resumable checkpoints."""
 
@@ -378,9 +554,56 @@ def train_model(
         raise ValueError("training.epochs must be positive")
 
     device = resolve_device(str(config.get("device", "auto")))
-    model.to(device=device, dtype=torch.float32)
+    model.to(device=device)
+    objective = str(config.get("objective", "legacy"))
+    if objective not in {"legacy", "teacher_v4", "student_distillation_v4"}:
+        raise ValueError(
+            "training.objective must be legacy, teacher_v4, or "
+            "student_distillation_v4"
+        )
+    distillation_config = dict(config.get("distillation", {}))
+    adapters: FeatureDistillationAdapters | None = None
+    if objective == "student_distillation_v4":
+        if teacher_model is None:
+            raise ValueError(
+                "student_distillation_v4 requires a loaded teacher_model"
+            )
+        if getattr(model, "architecture", None) != "student_v4":
+            raise ValueError("student_distillation_v4 requires model.architecture=student_v4")
+        teacher_model.to(device=device)
+        teacher_model.eval()
+        for parameter in teacher_model.parameters():
+            parameter.requires_grad_(False)
+        student_channels = tuple(
+            int(value)
+            for value in distillation_config.get(
+                "student_feature_channels", (64, 96)
+            )
+        )
+        teacher_channels = tuple(
+            int(value)
+            for value in distillation_config.get(
+                "teacher_feature_channels", (128, 192)
+            )
+        )
+        if len(student_channels) != 2 or len(teacher_channels) != 2:
+            raise ValueError("distillation feature channel lists must have two values")
+        adapters = FeatureDistillationAdapters(
+            student_channels=student_channels,
+            teacher_channels=teacher_channels,
+        ).to(device)
+    elif teacher_model is not None:
+        raise ValueError("teacher_model is only valid for student_distillation_v4")
+
+    trainable_parameters = [
+        parameter
+        for parameter in chain(
+            model.parameters(), adapters.parameters() if adapters is not None else ()
+        )
+        if parameter.requires_grad
+    ]
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        trainable_parameters,
         lr=float(config.get("learning_rate", 3e-4)),
         weight_decay=float(config.get("weight_decay", 1e-4)),
     )
@@ -441,6 +664,7 @@ def train_model(
             scheduler,
             scaler,
             device,
+            adapters,
         )
 
         # Older epoch checkpoints predate best-metric metadata. Recover it from
@@ -465,6 +689,11 @@ def train_model(
 
     writer = None
     if tensorboard_enabled:
+        if SummaryWriter is None:
+            raise ImportError(
+                "TensorBoard logging is enabled but tensorboard is not installed; "
+                "install requirements.txt or set training.tensorboard.enabled=false"
+            )
         tensorboard_dir = Path(
             tensorboard_config.get("log_dir", "runs/depth_refinement")
         ).expanduser()
@@ -497,6 +726,7 @@ def train_model(
 
     print(f"\nTraining device: {device}")
     print(f"Mixed precision: {use_amp}")
+    print(f"Training objective: {objective}")
     print(f"Loss: {loss_name}")
     print(f"LR scheduler: {config.get('lr_scheduler', 'cosine')}")
     print(f"Training split: train")
@@ -509,6 +739,10 @@ def train_model(
 
     for epoch in range(start_epoch, epochs + 1):
         model.train()
+        if adapters is not None:
+            adapters.train()
+        if teacher_model is not None:
+            teacher_model.eval()
         current_learning_rate = optimizer.param_groups[0]["lr"]
         epoch_loss = 0.0
         completed_batches = 0
@@ -533,27 +767,129 @@ def train_model(
                 dtype=torch.float16,
                 enabled=use_amp,
             ):
-                prediction = (
-                    model(image, tof_features)
-                    if tof_tokens is None
-                    else model(image, tof_features, tof_tokens)
-                )
-                loss = masked_depth_loss(
-                    prediction,
-                    target,
-                    valid_mask,
-                    loss_name,
-                    smooth_l1_beta,
-                    scale_invariant_lambda,
-                    scale_invariant_alpha,
-                    minimum_depth,
-                )
+                if objective == "teacher_v4":
+                    output = forward_depth_model(
+                        model,
+                        image,
+                        tof_features,
+                        tof_tokens,
+                        return_aux=True,
+                    )
+                    loss, _ = teacher_supervision_loss(
+                        output,
+                        target,
+                        valid_mask,
+                        metric_weight=float(config.get("metric_weight", 1.0)),
+                        gradient_weight=float(config.get("gradient_weight", 0.1)),
+                    )
+                elif objective == "student_distillation_v4":
+                    if tof_tokens is None or teacher_model is None or adapters is None:
+                        raise RuntimeError(
+                            "distillation requires tokens, teacher, and adapters"
+                        )
+                    student_output = forward_depth_model(
+                        model,
+                        image,
+                        tof_features,
+                        tof_tokens,
+                        return_aux=True,
+                    )
+                    if not isinstance(student_output, DepthOutput):
+                        raise TypeError("student_v4 must return DepthOutput with return_aux")
+                    strength = distillation_ramp(
+                        epoch,
+                        ground_truth_epochs=int(
+                            distillation_config.get("ground_truth_epochs", 5)
+                        ),
+                        ramp_end_epoch=int(
+                            distillation_config.get("ramp_end_epoch", 10)
+                        ),
+                    )
+                    metric_weight = float(
+                        distillation_config.get("metric_weight", 1.0)
+                    )
+                    gradient_weight = float(
+                        distillation_config.get("gradient_weight", 0.1)
+                    )
+                    outside_weight = float(
+                        distillation_config.get("outside_coverage_weight", 2.0)
+                    )
+                    inside_weight = float(
+                        distillation_config.get("inside_coverage_weight", 1.0)
+                    )
+                    if strength == 0.0:
+                        loss, _, _, _ = student_ground_truth_loss(
+                            student_output.depth,
+                            target,
+                            valid_mask,
+                            tof_tokens,
+                            metric_weight=metric_weight,
+                            gradient_weight=gradient_weight,
+                            outside_coverage_weight=outside_weight,
+                            inside_coverage_weight=inside_weight,
+                        )
+                    else:
+                        with torch.no_grad():
+                            teacher_output = forward_depth_model(
+                                teacher_model,
+                                image,
+                                tof_features,
+                                tof_tokens,
+                                return_aux=True,
+                            )
+                        if not isinstance(teacher_output, DepthOutput):
+                            raise TypeError(
+                                "teacher_v4 must return DepthOutput with return_aux"
+                            )
+                        loss, _ = student_distillation_loss(
+                            student_output,
+                            teacher_output,
+                            target,
+                            valid_mask,
+                            tof_tokens,
+                            adapters,
+                            distillation_strength=strength,
+                            metric_weight=metric_weight,
+                            gradient_weight=gradient_weight,
+                            teacher_depth_weight=float(
+                                distillation_config.get("teacher_depth_weight", 0.5)
+                            ),
+                            feature_weight=float(
+                                distillation_config.get("feature_weight", 0.05)
+                            ),
+                            outside_coverage_weight=outside_weight,
+                            inside_coverage_weight=inside_weight,
+                            confidence_temperature=float(
+                                distillation_config.get(
+                                    "confidence_temperature", 0.25
+                                )
+                            ),
+                            smooth_l1_beta=float(
+                                distillation_config.get("smooth_l1_beta", 0.1)
+                            ),
+                        )
+                else:
+                    prediction = forward_depth_model(
+                        model, image, tof_features, tof_tokens, return_aux=False
+                    )
+                    if not isinstance(prediction, Tensor):
+                        prediction = prediction.depth
+                    loss = masked_depth_loss(
+                        prediction,
+                        target,
+                        valid_mask,
+                        loss_name,
+                        smooth_l1_beta,
+                        scale_invariant_lambda,
+                        scale_invariant_alpha,
+                        minimum_depth,
+                    )
 
             scaler.scale(loss).backward()
             if gradient_clip_norm is not None:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), float(gradient_clip_norm)
+                    trainable_parameters, float(gradient_clip_norm)
                 )
             scaler.step(optimizer)
             scaler.update()
@@ -660,6 +996,7 @@ def train_model(
                     config,
                     best_validation_rmse,
                     best_epoch,
+                    adapters,
                 ),
             )
             print(
@@ -683,6 +1020,7 @@ def train_model(
                     config,
                     best_validation_rmse,
                     best_epoch,
+                    adapters,
                 ),
             )
             print(f"Saved checkpoint: {checkpoint_path.resolve()}")

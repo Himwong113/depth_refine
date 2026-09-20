@@ -3,15 +3,15 @@
 from __future__ import annotations
 
 import argparse
-from ast import arguments
 from pathlib import Path
 from typing import Any
 
 import torch
+from torch import nn
 import yaml
 
 from data import build_zjul5_dataloader
-from model import DepthRefinementUNet
+from model import DepthRefinementUNet, MobileDepthStudent, RGBToFTeacher
 
 
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent / "config.yml"
@@ -38,10 +38,22 @@ def load_config(config_path: Path) -> dict[str, Any]:
     return config
 
 
-def build_model(config: dict[str, Any]) -> DepthRefinementUNet:
-    """Pass all values under ``model`` to the PyTorch model constructor."""
+def build_model(config: dict[str, Any]) -> nn.Module:
+    """Construct an explicitly selected legacy, teacher, or student model."""
 
-    return DepthRefinementUNet(**config["model"])
+    options = dict(config["model"])
+    architecture = options.pop("architecture", "attention_v3")
+    constructors: dict[str, type[nn.Module]] = {
+        "attention_v3": DepthRefinementUNet,
+        "student_v4": MobileDepthStudent,
+        "teacher_v4": RGBToFTeacher,
+    }
+    if architecture not in constructors:
+        choices = ", ".join(constructors)
+        raise ValueError(
+            f"unsupported model architecture {architecture!r}; choose one of {choices}"
+        )
+    return constructors[architecture](**options)
 
 
 def format_memory_size(size_bytes: int) -> str:
@@ -56,7 +68,7 @@ def format_memory_size(size_bytes: int) -> str:
 
 
 def print_model_summary(
-    model: DepthRefinementUNet,
+    model: nn.Module,
     config_path: Path,
     model_options: dict[str, Any],
     summary_options: dict[str, Any],
