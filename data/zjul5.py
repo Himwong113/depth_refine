@@ -23,7 +23,8 @@ class ZJUL5Dataset(Dataset[dict[str, Any]]):
     Returned sample keys:
         ``image``: normalized ``float32`` tensor shaped ``(3, 480, 640)``.
         ``sparse_depth``: ToF mean depth shaped ``(1, 8, 8)``; invalid zones are 0.
-        ``target_depth``: high-resolution depth shaped ``(1, 480, 640)``.
+        ``target_depth``: high-resolution depth shaped ``(1, 480, 640)``, with
+        valid values clamped to the configured metric range.
         ``target_valid_mask``: valid target pixels shaped ``(1, 480, 640)``.
         ``sparse_valid_mask``: valid ToF zones shaped ``(1, 8, 8)``.
         ``path``: path of the source HDF5 file relative to the dataset root.
@@ -39,7 +40,8 @@ class ZJUL5Dataset(Dataset[dict[str, Any]]):
         normalize_image: bool = True,
         image_mean: tuple[float, float, float] | list[float] = (0.485, 0.456, 0.406),
         image_std: tuple[float, float, float] | list[float] = (0.229, 0.224, 0.225),
-        max_depth: float | None = None,
+        min_depth: float = 0.1,
+        max_depth: float = 10.0,
     ) -> None:
         self.root = Path(root).expanduser().resolve()
         if not self.root.is_dir():
@@ -87,13 +89,16 @@ class ZJUL5Dataset(Dataset[dict[str, Any]]):
             raise ValueError("image_mean and image_std must each contain three values")
         if any(value <= 0 for value in image_std):
             raise ValueError("all image_std values must be positive")
-        if max_depth is not None and max_depth <= 0:
-            raise ValueError("max_depth must be positive or null")
+        if min_depth <= 0:
+            raise ValueError("min_depth must be positive")
+        if max_depth <= min_depth:
+            raise ValueError("max_depth must be greater than min_depth")
 
         self.split = split
         self.normalize_image = normalize_image
         self.image_mean = torch.tensor(image_mean, dtype=torch.float32).view(3, 1, 1)
         self.image_std = torch.tensor(image_std, dtype=torch.float32).view(3, 1, 1)
+        self.min_depth = min_depth
         self.max_depth = max_depth
 
     def __len__(self) -> int:
@@ -139,10 +144,11 @@ class ZJUL5Dataset(Dataset[dict[str, Any]]):
         )
 
         target_valid_mask_array = np.isfinite(target_depth) & (target_depth > 0)
-        target_depth = np.where(target_valid_mask_array, target_depth, 0.0)
-        if self.max_depth is not None:
-            target_valid_mask_array &= target_depth <= self.max_depth
-            target_depth = np.where(target_valid_mask_array, target_depth, 0.0)
+        target_depth = np.where(
+            target_valid_mask_array,
+            np.clip(target_depth, self.min_depth, self.max_depth),
+            0.0,
+        )
 
         target_depth_tensor = torch.from_numpy(
             np.ascontiguousarray(target_depth[None, ...])
@@ -196,7 +202,8 @@ def build_zjul5_dataloader(config: dict[str, Any]) -> DataLoader[dict[str, Any]]
         "normalize_image": config.get("normalize_image", True),
         "image_mean": config.get("image_mean", (0.485, 0.456, 0.406)),
         "image_std": config.get("image_std", (0.229, 0.224, 0.225)),
-        "max_depth": config.get("max_depth"),
+        "min_depth": config.get("min_depth", 0.1),
+        "max_depth": config.get("max_depth", 10.0),
     }
     dataset = ZJUL5Dataset(**dataset_options)
 

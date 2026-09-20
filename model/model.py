@@ -1,10 +1,11 @@
 """Depth refinement network.
 
 The model accepts an RGB image and a (possibly lower-resolution) sparse depth
-map.  Independent encoder and decoder channel-attention matrices are computed
+map. Independent encoder and decoder channel-attention matrices are computed
 from image queries and interpolated-depth keys. The encoder matrix is shared by
-all encoder stages and the decoder matrix is shared by all decoder skip
-concatenations. Every location has its own value projection.
+all encoder stages and routed through the left nested branch. The decoder matrix
+is routed through the right branch, while center nodes learn to mix both.
+Every location has its own value projection.
 
 Tensor shapes
 -------------
@@ -28,6 +29,7 @@ __all__ = [
     "UpBlock",
     "SharedQKAttention",
     "AttentionValueFusion",
+    "DualAttentionValueFusion",
     "DepthRefinementUNet",
     "DepthRefinementModel",
     "DepthRefineNet",
@@ -74,7 +76,7 @@ class DownBlock(nn.Module):
 
 
 class UpBlock(nn.Module):
-    """Attend and refine an upsampled decoder/encoder skip concatenation."""
+    """Attend and refine an upsampled feature with one or more dense skips."""
 
     def __init__(
         self,
@@ -83,11 +85,16 @@ class UpBlock(nn.Module):
         out_channels: int,
         attention_channels: int | None = None,
         attention_dropout: float = 0.0,
+        dual_attention: bool = False,
     ) -> None:
         super().__init__()
         concatenated_channels = in_channels + skip_channels
+        self.dual_attention = dual_attention and attention_channels is not None
+        fusion_type = (
+            DualAttentionValueFusion if self.dual_attention else AttentionValueFusion
+        )
         self.attention_fusion = (
-            AttentionValueFusion(
+            fusion_type(
                 concatenated_channels,
                 attention_channels,
                 attention_dropout,
@@ -100,17 +107,27 @@ class UpBlock(nn.Module):
     def forward(
         self,
         x: Tensor,
-        skip: Tensor,
-        shared_attention: Tensor | None = None,
+        skip: Tensor | tuple[Tensor, ...],
+        shared_attention: Tensor | tuple[Tensor, Tensor] | None = None,
     ) -> Tensor:
+        skips = (skip,) if isinstance(skip, Tensor) else skip
+        if not skips:
+            raise ValueError("at least one skip tensor is required")
+        target_size = skips[0].shape[-2:]
+        if any(feature.shape[-2:] != target_size for feature in skips[1:]):
+            raise ValueError("all skip tensors must have the same spatial size")
+
         # An explicit target size also handles odd input heights and widths.
-        x = F.interpolate(x, size=skip.shape[-2:], mode="bilinear", align_corners=False)
-        concatenated = torch.cat((x, skip), dim=1)
+        x = F.interpolate(x, size=target_size, mode="bilinear", align_corners=False)
+        concatenated = torch.cat((x, *skips), dim=1)
         if self.attention_fusion is not None:
             if shared_attention is None:
-                raise ValueError(
-                    "shared_attention is required when decoder attention is enabled"
-                )
+                raise ValueError("shared_attention is required for attention fusion")
+            if self.dual_attention:
+                if not isinstance(shared_attention, tuple) or len(shared_attention) != 2:
+                    raise ValueError("dual attention requires (encoder, decoder) matrices")
+            elif isinstance(shared_attention, tuple):
+                raise ValueError("single attention requires one attention matrix")
             concatenated = self.attention_fusion(concatenated, shared_attention)
         return self.conv(concatenated)
 
@@ -228,8 +245,86 @@ class AttentionValueFusion(nn.Module):
         return self.norm(features + attended)
 
 
+class DualAttentionValueFusion(nn.Module):
+    """Merge encoder and decoder attention through parallel learned branches.
+
+    Both branches own private value/output projections. A learned softmax gate,
+    initialized to an equal mixture, combines their attended features before a
+    single residual addition and normalization.
+    """
+
+    def __init__(
+        self,
+        stage_channels: int,
+        attention_channels: int,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        if stage_channels <= 0 or attention_channels <= 0:
+            raise ValueError("stage_channels and attention_channels must be positive")
+
+        self.stage_channels = stage_channels
+        self.attention_channels = attention_channels
+        self.encoder_value_projection = nn.Conv2d(
+            stage_channels, attention_channels, kernel_size=1, bias=False
+        )
+        self.decoder_value_projection = nn.Conv2d(
+            stage_channels, attention_channels, kernel_size=1, bias=False
+        )
+        self.encoder_output_projection = nn.Conv2d(
+            attention_channels, stage_channels, kernel_size=1, bias=False
+        )
+        self.decoder_output_projection = nn.Conv2d(
+            attention_channels, stage_channels, kernel_size=1, bias=False
+        )
+        self.mix_logits = nn.Parameter(torch.zeros(2))
+        self.dropout = nn.Dropout2d(dropout)
+        self.norm = nn.GroupNorm(_group_count(stage_channels), stage_channels)
+
+    def _attend(
+        self,
+        features: Tensor,
+        attention: Tensor,
+        value_projection: nn.Conv2d,
+        output_projection: nn.Conv2d,
+    ) -> Tensor:
+        batch, _, height, width = features.shape
+        expected = (batch, self.attention_channels, self.attention_channels)
+        if tuple(attention.shape) != expected:
+            raise ValueError(
+                f"attention must have shape {expected}, got {tuple(attention.shape)}"
+            )
+        value = value_projection(features).flatten(2)
+        attended = torch.bmm(attention, value).reshape(
+            batch, self.attention_channels, height, width
+        )
+        return output_projection(attended)
+
+    def forward(
+        self,
+        features: Tensor,
+        shared_attention: tuple[Tensor, Tensor],
+    ) -> Tensor:
+        encoder_attention, decoder_attention = shared_attention
+        encoder_features = self._attend(
+            features,
+            encoder_attention,
+            self.encoder_value_projection,
+            self.encoder_output_projection,
+        )
+        decoder_features = self._attend(
+            features,
+            decoder_attention,
+            self.decoder_value_projection,
+            self.decoder_output_projection,
+        )
+        mix = F.softmax(self.mix_logits, dim=0).to(dtype=features.dtype)
+        attended = mix[0] * encoder_features + mix[1] * decoder_features
+        return self.norm(features + self.dropout(attended))
+
+
 class DepthRefinementUNet(nn.Module):
-    """U-Net with separate shared attention matrices for encoder and decoder.
+    """Nested U-Net (UNet++) with separate encoder and decoder attention.
 
     Args:
         image_channels: Number of image channels, normally three.
@@ -239,8 +334,10 @@ class DepthRefinementUNet(nn.Module):
         max_attention_tokens: Maximum spatial embedding size ``E`` used for Q/K.
         attention_dropout: Dropout probability for attention and attended values.
         decoder_attention: Compute a second RGB/interpolated-depth ``QK^T``
-            matrix with independent weights and apply it to decoder/encoder skip
-            concatenations through independent value paths.
+            matrix with independent weights. The decoder routes encoder
+            attention left, both matrices through the center, and decoder
+            attention right. When disabled, center nodes use encoder attention
+            and the right node has no attention fusion.
         residual_output: Add resized sparse depth to the predicted correction.
         positive_output: Apply ``softplus`` to the final prediction.
         depth_interpolation: Interpolation mode used to resize sparse depth.
@@ -254,7 +351,7 @@ class DepthRefinementUNet(nn.Module):
         max_attention_tokens: int = 1024,
         attention_dropout: float = 0.0,
         decoder_attention: bool = True,
-        residual_output: bool = True,
+        residual_output: bool = False,
         positive_output: bool = False,
         depth_interpolation: str = "bilinear",
     ) -> None:
@@ -306,23 +403,48 @@ class DepthRefinementUNet(nn.Module):
             if decoder_attention
             else None
         )
-        self.up3 = UpBlock(
+        # UNet++ nodes x_level_depth form an attention-routing tree: the left
+        # column uses A_enc, the center uses both, and the right uses A_dec.
+        self.up2_1 = UpBlock(
             widths[3],
             widths[2],
             widths[2],
-            decoder_attention_channels,
+            attention_channels,
             attention_dropout,
         )
-        self.up2 = UpBlock(
+        self.up1_1 = UpBlock(
             widths[2],
             widths[1],
             widths[1],
-            decoder_attention_channels,
+            attention_channels,
             attention_dropout,
         )
-        self.up1 = UpBlock(
+        self.up0_1 = UpBlock(
             widths[1],
             widths[0],
+            widths[0],
+            attention_channels,
+            attention_dropout,
+        )
+        self.up1_2 = UpBlock(
+            widths[2],
+            2 * widths[1],
+            widths[1],
+            attention_channels,
+            attention_dropout,
+            dual_attention=decoder_attention,
+        )
+        self.up0_2 = UpBlock(
+            widths[1],
+            2 * widths[0],
+            widths[0],
+            attention_channels,
+            attention_dropout,
+            dual_attention=decoder_attention,
+        )
+        self.up0_3 = UpBlock(
+            widths[1],
+            3 * widths[0],
             widths[0],
             decoder_attention_channels,
             attention_dropout,
@@ -367,22 +489,31 @@ class DepthRefinementUNet(nn.Module):
     def forward(self, image: Tensor, sparse_depth: Tensor) -> Tensor:
         sparse_depth = self._validate_inputs(image, sparse_depth)
         resized_depth = self._resize_depth(sparse_depth, image.shape[-2:])
-        shared_attention = self.shared_qk(image, resized_depth)
+        encoder_attention = self.shared_qk(image, resized_depth)
 
-        image1 = self.fuse1(self.image_stem(image), shared_attention)
-        image2 = self.fuse2(self.image_down1(image1), shared_attention)
-        image3 = self.fuse3(self.image_down2(image2), shared_attention)
-        image4 = self.fuse4(self.image_down3(image3), shared_attention)
+        x0_0 = self.fuse1(self.image_stem(image), encoder_attention)
+        x1_0 = self.fuse2(self.image_down1(x0_0), encoder_attention)
+        x2_0 = self.fuse3(self.image_down2(x1_0), encoder_attention)
+        x3_0 = self.fuse4(self.image_down3(x2_0), encoder_attention)
 
         decoder_attention = (
             self.decoder_shared_qk(image, resized_depth)
             if self.decoder_shared_qk is not None
             else None
         )
-        decoded = self.up3(image4, image3, decoder_attention)
-        decoded = self.up2(decoded, image2, decoder_attention)
-        decoded = self.up1(decoded, image1, decoder_attention)
-        prediction = self.output_head(decoded)
+        center_attention = (
+            (encoder_attention, decoder_attention)
+            if decoder_attention is not None
+            else encoder_attention
+        )
+
+        x2_1 = self.up2_1(x3_0, x2_0, encoder_attention)
+        x1_1 = self.up1_1(x2_0, x1_0, encoder_attention)
+        x0_1 = self.up0_1(x1_0, x0_0, encoder_attention)
+        x1_2 = self.up1_2(x2_1, (x1_0, x1_1), center_attention)
+        x0_2 = self.up0_2(x1_1, (x0_0, x0_1), center_attention)
+        x0_3 = self.up0_3(x1_2, (x0_0, x0_1, x0_2), decoder_attention)
+        prediction = self.output_head(x0_3)
 
         if self.residual_output:
             prediction = prediction + resized_depth

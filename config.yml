@@ -8,7 +8,7 @@ model:
   attention_channels: 32
 
   # Maximum flattened spatial embedding E used to create the shared QK^T.
-  max_attention_tokens: 1024
+  max_attention_tokens: 512
   attention_dropout: 0.0
 
   # Build a second QK^T from RGB and interpolated depth using independent
@@ -44,8 +44,9 @@ data:
   image_mean: [0.485, 0.456, 0.406]
   image_std: [0.229, 0.224, 0.225]
 
-  # Use null to retain all positive ground-truth depths.
-  max_depth: null
+  # Clamp valid high-resolution ground-truth depth to this metric range.
+  min_depth: 0.1
+  max_depth: 10.0
 
   # main.py reads and reports one batch when enabled.
   inspect_first_batch: true

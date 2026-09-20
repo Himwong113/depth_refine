@@ -33,9 +33,11 @@ python main.py
 
 The model creates **two separate shared `QKᵀ` channel-attention matrices**.
 `Aenc` comes from RGB and interpolated sparse depth and is shared by the encoder
-levels. `Adec` uses the same two inputs but independent Q/K projection weights,
-and is shared only by decoder concatenations. Every encoder level and decoder
-concatenation has an independent value projection.
+levels. `Adec` uses the same two inputs but independent Q/K projection weights.
+The nested decoder routes attention like a three-part tree: its left column uses
+`Aenc`, its right column uses `Adec`, and its center column learns a softmax
+mixture of parallel `Aenc` and `Adec` value branches. Every location owns its
+value and output projections.
 
 ### Publication-style architecture figure
 
@@ -128,37 +130,40 @@ flowchart TB
     RGB --> DQE
     RESIZE --> DKE
 
-    subgraph DECODER["U-Net Decoder — independent V for each skip concatenation"]
-        direction TB
-        C3["C₃ = Upsample(F₄) concat F₃<br/>B × 12C × H/4 × W/4"]
-        DV3["Independent decoder value<br/>Vᵈ₃ = Proj(C₃)"]
-        DF3["G₃ = Norm(C₃ + Proj(Adec · Vᵈ₃))"]
-        U3["DoubleConv → D₃: 4C"]
-
-        C2["C₂ = Upsample(D₃) concat F₂<br/>B × 6C × H/2 × W/2"]
-        DV2["Independent decoder value<br/>Vᵈ₂ = Proj(C₂)"]
-        DF2["G₂ = Norm(C₂ + Proj(Adec · Vᵈ₂))"]
-        U2["DoubleConv → D₂: 2C"]
-
-        C1["C₁ = Upsample(D₂) concat F₁<br/>B × 3C × H × W"]
-        DV1["Independent decoder value<br/>Vᵈ₁ = Proj(C₁)"]
-        DF1["G₁ = Norm(C₁ + Proj(Adec · Vᵈ₁))"]
-        U1["DoubleConv → D₁: C"]
+    subgraph DECODER["UNet++ nested decoder — independent V at every node"]
+        direction LR
+        X21["X₂,₁ = D(↑F₄ ⊕ F₃)<br/>Aenc · private V"]
+        X11["X₁,₁ = D(↑F₃ ⊕ F₂)<br/>Aenc · private V"]
+        X01["X₀,₁ = D(↑F₂ ⊕ F₁)<br/>Aenc · private V"]
+        X12["X₁,₂ = D(↑X₂,₁ ⊕ F₂ ⊕ X₁,₁)<br/>learned mix of Aenc and Adec"]
+        X02["X₀,₂ = D(↑X₁,₁ ⊕ F₁ ⊕ X₀,₁)<br/>learned mix of Aenc and Adec"]
+        X03["X₀,₃ = D(↑X₁,₂ ⊕ F₁ ⊕ X₀,₁ ⊕ X₀,₂)<br/>Adec · private V"]
         HEAD["1 × 1 convolution<br/>Depth correction"]
 
-        C3 --> DV3 --> DF3 --> U3
-        U3 --> C2 --> DV2 --> DF2 --> U2
-        U2 --> C1 --> DV1 --> DF1 --> U1 --> HEAD
+        X21 --> X12 --> X03 --> HEAD
+        X11 --> X12
+        X11 --> X02 --> X03
+        X01 --> X02
     end
 
-    F4 --> C3
-    F3 -.->|"skip F₃"| C3
-    F2 -.->|"skip F₂"| C2
-    F1 -.->|"skip F₁"| C1
+    F4 --> X21
+    F3 --> X21
+    F3 --> X11
+    F2 --> X11
+    F2 --> X01
+    F2 --> X12
+    F1 --> X01
+    F1 --> X02
+    F1 --> X03
 
-    DA ==>|"same Adec"| DF3
-    DA ==>|"same Adec"| DF2
-    DA ==>|"same Adec"| DF1
+    A ==>|"left"| X21
+    A ==>|"left"| X11
+    A ==>|"left"| X01
+    A ==>|"center"| X12
+    A ==>|"center"| X02
+    DA ==>|"center"| X12
+    DA ==>|"center"| X02
+    DA ==>|"right"| X03
 
     ADD["Residual addition"]
     OUT["Dense depth<br/>B × 1 × H × W"]
@@ -175,8 +180,8 @@ flowchart TB
     class RGB,QE,Q,E1,E2,E3,E4,DQE,DQ image;
     class SD,RESIZE,KE,K,DKE,DK depth;
     class A,DA attention;
-    class V1,V2,V3,V4,DV1,DV2,DV3 value;
-    class F1,F2,F3,F4,C1,C2,C3,DF1,DF2,DF3,U3,U2,U1,HEAD,ADD,OUT output;
+    class V1,V2,V3,V4 value;
+    class F1,F2,F3,F4,X21,X11,X01,X12,X02,X03,HEAD,ADD,OUT output;
 ```
 
 The attention operations are:
@@ -197,20 +202,25 @@ Qdec = decoder_image_embedding(RGB)          # independent decoder Q weights
 Kdec = decoder_depth_embedding(resized_depth)# independent decoder K weights
 Adec = softmax(Qdec Kdecᵀ / √Edec)           # decoder matrix, computed once
 
-Cᵢ = concat(upsample(Dᵢ₊₁), Fᵢ)    # decoder input + encoder skip
-Vᵈᵢ = decoder_value_projectionᵢ(Cᵢ) # independent decoder weights
-Gᵢ = GroupNorm(Cᵢ + output_projectionᵈᵢ(Adec · Vᵈᵢ))
-Dᵢ = DoubleConvᵢ(Gᵢ)
+Cᵢⱼ = concat(upsample(Xᵢ₊₁,ⱼ₋₁), Xᵢ,₀, ..., Xᵢ,ⱼ₋₁)
+Left(C) = GroupNorm(C + Wenc(Aenc · Venc(C)))
+Right(C) = GroupNorm(C + Wdec(Adec · Vdec(C)))
+Center(C) = GroupNorm(C + α Wenc(Aenc · Venc(C))
+                         + β Wdec(Adec · Vdec(C)))
+[α, β] = softmax(learned logits)  # initialized to [0.5, 0.5]
+Xᵢⱼ = DoubleConvᵢⱼ(Route(Cᵢⱼ))
 ```
 
-The default encoder channel widths are `32 → 64 → 128 → 256`. Encoder and
-decoder value projections both use `Cattn = 32`, but they consume their own
-separate shared matrices (`Aenc` and `Adec`). Set `model.decoder_attention` to
-`false` to disable decoder attention.
+Encoder channel widths follow `C → 2C → 4C → 8C`, where `C` is
+`model.base_channels`. Dense UNet++ skip paths connect every earlier node at a
+resolution to the next nested decoder node. Attention value projections use
+`model.attention_channels`. With
+`model.decoder_attention: false`, the left and center columns use `Aenc` and
+the right node runs without attention fusion.
 
-Checkpoints created before decoder attention was added do not contain the new
-decoder Q/K/V weights. They remain usable with `decoder_attention: false`; train
-from scratch with `decoder_attention: true` to use the new architecture.
+The nested decoder changes parameter names and concatenation widths, so
+checkpoints from the earlier plain U-Net are not compatible. Train this
+architecture from scratch.
 
 ## Configuration
 
@@ -238,7 +248,8 @@ reports the first batch. Each batch contains:
 
 - `image`: normalized RGB tensor, `[B, 3, 480, 640]`.
 - `sparse_depth`: valid ToF mean depths, `[B, 1, 8, 8]`.
-- `target_depth`: high-resolution target depth, `[B, 1, 480, 640]`.
+- `target_depth`: high-resolution target depth clamped to `0.1`-`10.0 m`,
+  `[B, 1, 480, 640]`.
 - `sparse_valid_mask`: validity of the 64 ToF zones.
 - `target_valid_mask`: validity of high-resolution depth pixels.
 - `path`: source HDF5 path relative to the dataset root.

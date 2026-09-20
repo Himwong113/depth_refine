@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from ast import arguments
 from pathlib import Path
 from typing import Any
 
@@ -124,16 +125,26 @@ def main() -> None:
         default=DEFAULT_CONFIG_PATH,
         help=f"YAML configuration path (default: {DEFAULT_CONFIG_PATH})",
     )
+    parser.add_argument(
+        "--para-summary",
+        action="store_true",
+        default=False,
+        help="show model parameter and memory statistics",
+    )
     arguments = parser.parse_args()
 
     config = load_config(arguments.config)
     model = build_model(config)
+   
     print_model_summary(
         model,
         arguments.config,
         config["model"],
         config.get("summary", {}),
     )
+    if arguments.para_summary:
+        print("\nExiting after parameter summary as requested by --para-summary.")
+        exit(0)
 
     if "data" in config:
         data_loader = build_zjul5_dataloader(config["data"])
@@ -144,3 +155,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+ 

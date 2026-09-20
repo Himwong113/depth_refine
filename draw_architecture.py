@@ -237,7 +237,7 @@ def render() -> None:
     ax.text(
         10.5,
         11.63,
-        "DepthRefinementUNet",
+        "DepthRefinementUNet++",
         ha="center",
         va="center",
         fontsize=22,
@@ -247,7 +247,7 @@ def render() -> None:
     ax.text(
         10.5,
         11.25,
-        "Dual shared channel attention with independent values at every U-Net level",
+        "Tree-routed attention: encoder left, learned dual center, decoder right",
         ha="center",
         va="center",
         fontsize=11,
@@ -268,75 +268,111 @@ def render() -> None:
         arrow(ax, (2.00, 9.90), (target_x, 9.42), color=RGB_EDGE, connection="arc3,rad=-0.08")
         arrow(ax, (2.00, 7.50), (target_x + 1.50, 8.80), color=DEPTH_EDGE, connection="arc3,rad=0.08")
 
-    # U-Net stages.
+    # Encoder stages.
     e1 = stage(ax, 1.10, 3.65, "ENCODER E1", "H × W × C", ["DoubleConv", "private V1", "A_enc · V1", "Add & GroupNorm"], face=ENC, edge=ENC_EDGE)
     e2 = stage(ax, 3.55, 3.00, "ENCODER E2", "H/2 × W/2 × 2C", ["MaxPool ↓2", "DoubleConv", "private V2", "A_enc · V2", "Add & GroupNorm"], face=ENC, edge=ENC_EDGE)
     e3 = stage(ax, 6.00, 2.35, "ENCODER E3", "H/4 × W/4 × 4C", ["MaxPool ↓2", "DoubleConv", "private V3", "A_enc · V3", "Add & GroupNorm"], face=ENC, edge=ENC_EDGE)
     e4 = stage(ax, 8.45, 1.70, "BOTTLENECK E4", "H/8 × W/8 × 8C", ["MaxPool ↓2", "DoubleConv", "private V4", "A_enc · V4", "Add & GroupNorm"], face=ENC, edge=ENC_EDGE)
 
-    d3 = stage(ax, 10.90, 2.35, "DECODER D3", "H/4 × W/4 × 4C", ["↑2 + concat E3", "private Vd3", "A_dec · Vd3", "Add & GroupNorm", "DoubleConv"], face=DEC, edge=DEC_EDGE)
-    d2 = stage(ax, 13.35, 3.00, "DECODER D2", "H/2 × W/2 × 2C", ["↑2 + concat E2", "private Vd2", "A_dec · Vd2", "Add & GroupNorm", "DoubleConv"], face=DEC, edge=DEC_EDGE)
-    d1 = stage(ax, 15.80, 3.65, "DECODER D1", "H × W × C", ["↑2 + concat E1", "private Vd1", "A_dec · Vd1", "Add & GroupNorm", "DoubleConv"], face=DEC, edge=DEC_EDGE)
-
-    stages = [e1, e2, e3, e4, d3, d2, d1]
-    for left, right, edge in zip(stages[:-1], stages[1:], [ENC_EDGE] * 3 + [INK] + [DEC_EDGE] * 2):
+    encoders = [e1, e2, e3, e4]
+    for left, right in zip(encoders[:-1], encoders[1:]):
         arrow(
             ax,
             (left[0] + left[2], left[1] + left[3] / 2),
             (right[0], right[1] + right[3] / 2),
-            color=edge,
+            color=ENC_EDGE,
             linewidth=1.7,
+        )
+
+    # Dense UNet++ decoder nodes with tree-routed attention sources.
+    def nested_node(x: float, y: float, name: str, shape: str, route: str):
+        box(
+            ax,
+            x,
+            y,
+            1.85,
+            1.15,
+            f"{name}  {shape}\n↑ + dense concat\n{route}\nDoubleConv",
+            face=DEC,
+            edge=DEC_EDGE,
+            fontsize=6.8,
+            weight="bold",
+            radius=0.10,
+        )
+        return (x, y, 1.85, 1.15)
+
+    x21 = nested_node(10.65, 2.30, "X₂,₁", "4C", "private V + A_enc")
+    x11 = nested_node(10.65, 3.90, "X₁,₁", "2C", "private V + A_enc")
+    x01 = nested_node(10.65, 5.50, "X₀,₁", "C", "private V + A_enc")
+    x12 = nested_node(13.25, 3.90, "X₁,₂", "2C", "learned A_enc / A_dec mix")
+    x02 = nested_node(13.25, 5.50, "X₀,₂", "C", "learned A_enc / A_dec mix")
+    x03 = nested_node(15.85, 5.50, "X₀,₃", "C", "private V + A_dec")
+
+    # Upsampling dependencies through the triangular nested grid.
+    for source, target in ((e4, x21), (e3, x11), (e2, x01), (x21, x12), (x11, x02), (x12, x03)):
+        arrow(
+            ax,
+            (source[0] + source[2], source[1] + source[3] / 2),
+            (target[0], target[1] + target[3] / 2),
+            color=DEC_EDGE if source not in encoders else INK,
+            linewidth=1.45,
+        )
+
+    # Dense same-resolution skip paths.
+    dense_paths = (
+        (e3, x21, -0.08),
+        (e2, x11, -0.08),
+        (e1, x01, -0.08),
+        (x11, x12, 0.0),
+        (x01, x02, 0.0),
+        (e2, x12, -0.18),
+        (e1, x02, -0.16),
+        (x02, x03, 0.0),
+        (e1, x03, -0.22),
+        (x01, x03, -0.12),
+    )
+    for source, target, curvature in dense_paths:
+        arrow(
+            ax,
+            (source[0] + source[2] / 2, source[1] + source[3]),
+            (target[0] + target[2] / 2, target[1] + target[3]),
+            color="#68758A",
+            linewidth=0.95,
+            dashed=True,
+            connection=f"arc3,rad={curvature}",
+            zorder=1,
         )
 
     # RGB enters E1.
     arrow(ax, (1.10, 9.55), (1.65, 6.50), color=RGB_EDGE, connection="arc3,rad=0.06")
 
-    # U-Net skip connections.
-    skip_specs = [
-        (e1, d1, 7.05, "skip E1"),
-        (e2, d2, 6.65, "skip E2"),
-        (e3, d3, 6.25, "skip E3"),
-    ]
-    for source, target, apex, label in skip_specs:
-        sx = source[0] + source[2] / 2
-        tx = target[0] + target[2] / 2
-        sy = source[1] + source[3]
-        ty = target[1] + target[3]
-        arrow(
-            ax,
-            (sx, sy),
-            (tx, ty),
-            color="#68758A",
-            linewidth=1.15,
-            connection=f"arc3,rad={-0.20 if label == 'skip E1' else -0.16}",
-        )
-        ax.text((sx + tx) / 2, apex, label, ha="center", va="center", fontsize=7.2, color=MUTED)
+    ax.text(13.65, 6.88, "dense same-resolution skips", ha="center", fontsize=7.2, color=MUTED)
 
     # Shared attention buses (one matrix reused within each side).
-    ax.plot([2.15, 9.15], [7.55, 7.55], color=ENC_EDGE, linewidth=1.4, linestyle="--", zorder=1)
-    arrow(ax, (6.90, 8.35), (6.90, 7.55), color=ENC_EDGE, dashed=True)
-    for stage_box in (e1, e2, e3, e4):
+    ax.plot([2.15, 14.20], [7.75, 7.75], color=ENC_EDGE, linewidth=1.4, linestyle="--", zorder=1)
+    arrow(ax, (6.90, 8.35), (6.90, 7.75), color=ENC_EDGE, dashed=True)
+    for stage_box in (e1, e2, e3, e4, x21, x11, x01, x12, x02):
         cx = stage_box[0] + stage_box[2] / 2
-        arrow(ax, (cx, 7.55), (cx, stage_box[1] + stage_box[3]), color=ENC_EDGE, dashed=True, linewidth=1.1)
-    ax.text(2.25, 7.72, "same A_enc", fontsize=7.4, color=ENC_EDGE, fontweight="bold")
+        arrow(ax, (cx, 7.75), (cx, stage_box[1] + stage_box[3]), color=ENC_EDGE, dashed=True, linewidth=1.1)
+    ax.text(7.30, 7.90, "A_enc → encoder + left + center", fontsize=7.4, color=ENC_EDGE, fontweight="bold")
 
-    ax.plot([11.75, 16.70], [7.35, 7.35], color=DEC_EDGE, linewidth=1.4, linestyle="--", zorder=1)
+    ax.plot([10.95, 17.15], [7.35, 7.35], color=DEC_EDGE, linewidth=1.4, linestyle="--", zorder=1)
     arrow(ax, (13.40, 8.35), (13.40, 7.35), color=DEC_EDGE, dashed=True)
-    for stage_box in (d3, d2, d1):
+    for stage_box in (x12, x02, x03):
         cx = stage_box[0] + stage_box[2] / 2
         arrow(ax, (cx, 7.35), (cx, stage_box[1] + stage_box[3]), color=DEC_EDGE, dashed=True, linewidth=1.1)
-    ax.text(15.70, 7.52, "same A_dec", fontsize=7.4, color=DEC_EDGE, fontweight="bold")
+    ax.text(15.15, 7.48, "A_dec → center + right", fontsize=7.4, color=DEC_EDGE, fontweight="bold")
 
     # Output head and sparse-depth residual.
-    box(ax, 18.05, 4.75, 1.05, 0.72, "1 × 1 Conv\ndepth Δ", face=OUTPUT, edge="#2A7C86", fontsize=7.5, weight="bold")
-    arrow(ax, (17.58, 5.22), (18.05, 5.12), color="#2A7C86", linewidth=1.7)
-    add = Circle((19.55, 5.10), 0.25, facecolor=WHITE, edgecolor="#2A7C86", linewidth=1.6, zorder=4)
+    box(ax, 18.05, 5.72, 1.05, 0.72, "1 × 1 Conv\ndepth Δ", face=OUTPUT, edge="#2A7C86", fontsize=7.5, weight="bold")
+    arrow(ax, (17.70, 6.08), (18.05, 6.08), color="#2A7C86", linewidth=1.7)
+    add = Circle((19.55, 6.08), 0.25, facecolor=WHITE, edgecolor="#2A7C86", linewidth=1.6, zorder=4)
     ax.add_patch(add)
-    ax.text(19.55, 5.10, "+", ha="center", va="center", fontsize=14, color=INK, zorder=5)
-    arrow(ax, (19.10, 5.10), (19.30, 5.10), color="#2A7C86", linewidth=1.7)
-    box(ax, 19.95, 4.72, 0.80, 0.76, "Softplus*", face=OUTPUT, edge="#2A7C86", fontsize=7.4, weight="bold")
-    arrow(ax, (19.80, 5.10), (19.95, 5.10), color="#2A7C86", linewidth=1.7)
-    ax.text(20.35, 4.46, "dense depth\nB × 1 × H × W", ha="center", va="top", fontsize=7.1, color=MUTED)
+    ax.text(19.55, 6.08, "+", ha="center", va="center", fontsize=14, color=INK, zorder=5)
+    arrow(ax, (19.10, 6.08), (19.30, 6.08), color="#2A7C86", linewidth=1.7)
+    box(ax, 19.95, 5.70, 0.80, 0.76, "Softplus*", face=OUTPUT, edge="#2A7C86", fontsize=7.4, weight="bold")
+    arrow(ax, (19.80, 6.08), (19.95, 6.08), color="#2A7C86", linewidth=1.7)
+    ax.text(20.35, 5.44, "dense depth\nB × 1 × H × W", ha="center", va="top", fontsize=7.1, color=MUTED)
 
     # Residual route from resized sparse depth.
     ax.plot(
@@ -347,7 +383,7 @@ def render() -> None:
         linestyle="--",
         zorder=1,
     )
-    arrow(ax, (19.55, 1.18), (19.55, 4.85), color=DEPTH_EDGE, linewidth=1.3, dashed=True, zorder=1)
+    arrow(ax, (19.55, 1.18), (19.55, 5.83), color=DEPTH_EDGE, linewidth=1.3, dashed=True, zorder=1)
     ax.text(10.2, 1.34, "resized sparse-depth residual", ha="center", va="center", fontsize=7.5, color=DEPTH_EDGE)
 
     # Formula and legend strip.
@@ -355,16 +391,16 @@ def render() -> None:
         ax,
         0.40,
         0.18,
-        6.15,
+        7.30,
         0.58,
-        "AttentionValueFusionᵢ:  Fᵢ = GroupNorm(Xᵢ + Wₒᵢ (A · Wᵥᵢ Xᵢ))",
+        "Tree fusion: left A_enc · V  |  center α(A_enc · V_enc) + β(A_dec · V_dec)  |  right A_dec · V",
         face="#FAF7E8",
         edge="#B89A2C",
-        fontsize=7.7,
+        fontsize=6.8,
     )
-    ax.text(7.0, 0.48, "Solid arrows: feature flow", fontsize=7.2, color=INK, va="center")
-    ax.text(9.6, 0.48, "Dashed arrows: shared attention / residual", fontsize=7.2, color=MUTED, va="center")
-    ax.text(14.35, 0.48, "Yellow: independent V projection", fontsize=7.2, color="#8A701A", va="center")
+    ax.text(8.0, 0.48, "Solid arrows: feature flow", fontsize=7.2, color=INK, va="center")
+    ax.text(10.6, 0.48, "Dashed arrows: shared attention / residual", fontsize=7.2, color=MUTED, va="center")
+    ax.text(15.15, 0.48, "Yellow: independent V projection", fontsize=7.2, color="#8A701A", va="center")
     ax.text(18.05, 0.48, "* enabled in config.yml", fontsize=7.2, color=MUTED, va="center")
 
     svg_path = OUTPUT_DIR / "depth_refinement_architecture.svg"
