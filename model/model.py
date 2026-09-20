@@ -186,8 +186,6 @@ class DepthRefinementUNet(nn.Module):
             widths[0] + image_channels, widths[0]
         )
         self.depth_head = nn.Conv2d(widths[0], 1, kernel_size=1)
-        nn.init.zeros_(self.depth_head.weight)
-        nn.init.zeros_(self.depth_head.bias)
 
     @staticmethod
     def _normalized_resize(

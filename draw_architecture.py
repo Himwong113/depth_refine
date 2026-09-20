@@ -124,7 +124,7 @@ def render() -> None:
     axis.text(
         0.5,
         7.18,
-        "122.7K parameters • 1.54G convolution MACs at 640×480 • confidence-gated metric depth",
+        "155.0K parameters • 1.43G convolution MACs at 640×480 • coarse gated ToF fusion",
         fontsize=9,
         color=MUTED,
     )
@@ -158,8 +158,8 @@ def render() -> None:
         4.6,
         2.0,
         1.25,
-        "Input fusion",
-        "RGB + local ToF\n+ global scale",
+        "RGB stem",
+        "RGB only • 1/2",
         RGB,
         RGB_EDGE,
     )
@@ -173,10 +173,21 @@ def render() -> None:
         5.0,
         1.8,
         1.05,
-        "Bottleneck",
-        "128 ch • 1/16\nchannel context",
+        "RGB Encoder 4",
+        "128 ch • 1/16",
         ENC,
         ENC_EDGE,
+    )
+    tof_gate = box(
+        axis,
+        16.2,
+        5.0,
+        1.35,
+        1.05,
+        "ToF gate",
+        "coarse fusion\n+ context",
+        TOF,
+        TOF_EDGE,
     )
 
     d3 = box(axis, 13.95, 2.75, 1.8, 1.05, "Decoder 3", "96 ch • 1/8", DEC, DEC_EDGE)
@@ -199,8 +210,8 @@ def render() -> None:
         1.15,
         2.25,
         1.15,
-        "Depth + confidence",
-        "learned depth blended\nwith valid ToF prior",
+        "Residual + scale",
+        "learned dense residual\n+ global ToF mean",
         HEAD,
         HEAD_EDGE,
     )
@@ -218,12 +229,12 @@ def render() -> None:
 
     arrow(axis, center_right(tof), center_left(raster), TOF_EDGE)
     arrow(axis, center_right(rgb), center_left(fusion), RGB_EDGE, curve=0.08)
-    arrow(axis, center_right(raster), center_left(fusion), TOF_EDGE, curve=-0.08)
     arrow(axis, center_right(fusion), center_left(e1), RGB_EDGE)
     arrow(axis, center_right(e1), center_left(e2), ENC_EDGE)
     arrow(axis, center_right(e2), center_left(e3), ENC_EDGE)
     arrow(axis, center_right(e3), center_left(e4), ENC_EDGE)
-    arrow(axis, center_bottom(e4), center_top(d3), DEC_EDGE)
+    arrow(axis, center_right(e4), center_left(tof_gate), ENC_EDGE)
+    arrow(axis, center_bottom(tof_gate), center_top(d3), DEC_EDGE, curve=0.08)
     arrow(axis, center_left(d3), center_right(d2), DEC_EDGE)
     arrow(axis, center_left(d2), center_right(d1), DEC_EDGE)
     arrow(axis, center_bottom(d1), center_top(refine), DEC_EDGE, curve=0.1)
@@ -234,12 +245,13 @@ def render() -> None:
     arrow(axis, center_bottom(e2), center_top(d2), ENC_EDGE, dashed=True)
     arrow(axis, center_bottom(e1), center_top(d1), ENC_EDGE, dashed=True)
     arrow(axis, center_bottom(fusion), center_top(refine), RGB_EDGE, dashed=True, curve=0.18)
+    arrow(axis, center_right(raster), center_left(tof_gate), TOF_EDGE, dashed=True, curve=-0.18)
     arrow(axis, center_bottom(raster), center_top(heads), TOF_EDGE, dashed=True, curve=-0.22)
 
     axis.text(
         9.1,
         0.45,
-        "Solid: main feature flow   •   Dashed: additive skips and calibrated ToF prior",
+        "Solid: feature flow   •   Dashed: RGB skips, coarse ToF context, and global scale only",
         ha="center",
         fontsize=8,
         color=MUTED,

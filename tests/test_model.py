@@ -26,6 +26,9 @@ class DepthRefinementUNetTests(unittest.TestCase):
         self.assertIsNotNone(model.depth_head.weight.grad)
         self.assertIsNotNone(model.tof_fusion.tof_projection[0].weight.grad)
         self.assertIsNotNone(model.tof_fusion.gate[0].weight.grad)
+        self.assertGreater(
+            model.tof_fusion.tof_projection[0].weight.grad.abs().sum().item(), 0.0
+        )
 
     def test_output_has_no_direct_rectangular_tof_blend(self) -> None:
         model = DepthRefinementUNet(base_channels=8).eval()
@@ -34,6 +37,9 @@ class DepthRefinementUNetTests(unittest.TestCase):
         tof[:, 0, :, :24] = 1.0
         tof[:, 0, :, 24:] = 3.0
         tof[:, 2] = 1.0
+        with torch.no_grad():
+            model.depth_head.weight.zero_()
+            model.depth_head.bias.zero_()
 
         with torch.inference_mode():
             output = model(image, tof)
