@@ -31,12 +31,12 @@ python main.py
 
 ## Architecture
 
-The model creates **two separate shared `QKᵀ` channel-attention matrices**.
-`Aenc` comes from RGB and interpolated sparse depth and is shared by the encoder
-levels. `Adec` uses the same two inputs but independent Q/K projection weights.
-The nested decoder routes attention like a three-part tree: its left column uses
-`Aenc`, its right column uses `Adec`, and its center column learns a softmax
-mixture of parallel `Aenc` and `Adec` value branches. Every location owns its
+The model creates two RGB/depth `QKᵀ` channel-attention matrices plus three
+adjacent-encoder feature matrices. `Aenc` is shared by the encoder levels;
+`Adec` uses independent RGB/depth projections. For the nested decoder's left
+column, `A21`, `A32`, and `A43` are computed from successive encoder feature
+pairs and routed to the matching resolution. The center learns a mixture of
+`Aenc` and `Adec`, while the right column uses `Adec`. Every location owns its
 value and output projections.
 
 ### Publication-style architecture figure
@@ -53,9 +53,9 @@ source .venv/bin/activate
 python draw_architecture.py
 ```
 
-The solid paths show feature flow, dashed purple/orange paths show attention
-matrices shared within the encoder or decoder, and yellow modules identify the
-independent value projections.
+The solid paths show feature flow, dashed purple/orange paths show shared
+RGB/depth attention, and the left decoder nodes identify their adjacent-stage
+attention matrices.
 
 ```mermaid
 flowchart TB
@@ -113,6 +113,16 @@ flowchart TB
     A ==>|"same Aenc"| F3
     A ==>|"same Aenc"| F4
 
+    A21["A21 = softmax(Q(F1)K(F2)ᵀ / √E21)"]
+    A32["A32 = softmax(Q(F2)K(F3)ᵀ / √E32)"]
+    A43["A43 = softmax(Q(F3)K(F4)ᵀ / √E43)"]
+    F1 --> A21
+    F2 --> A21
+    F2 --> A32
+    F3 --> A32
+    F3 --> A43
+    F4 --> A43
+
     subgraph DQK["Decoder shared QKᵀ — separate and computed once"]
         direction LR
         DQE["RGB image<br/>independent decoder query projection"]
@@ -132,9 +142,9 @@ flowchart TB
 
     subgraph DECODER["UNet++ nested decoder — independent V at every node"]
         direction LR
-        X21["X₂,₁ = D(↑F₄ ⊕ F₃)<br/>Aenc · private V"]
-        X11["X₁,₁ = D(↑F₃ ⊕ F₂)<br/>Aenc · private V"]
-        X01["X₀,₁ = D(↑F₂ ⊕ F₁)<br/>Aenc · private V"]
+        X21["X₂,₁ = D(↑F₄ ⊕ F₃)<br/>A43 · private V"]
+        X11["X₁,₁ = D(↑F₃ ⊕ F₂)<br/>A32 · private V"]
+        X01["X₀,₁ = D(↑F₂ ⊕ F₁)<br/>A21 · private V"]
         X12["X₁,₂ = D(↑X₂,₁ ⊕ F₂ ⊕ X₁,₁)<br/>learned mix of Aenc and Adec"]
         X02["X₀,₂ = D(↑X₁,₁ ⊕ F₁ ⊕ X₀,₁)<br/>learned mix of Aenc and Adec"]
         X03["X₀,₃ = D(↑X₁,₂ ⊕ F₁ ⊕ X₀,₁ ⊕ X₀,₂)<br/>Adec · private V"]
@@ -156,9 +166,9 @@ flowchart TB
     F1 --> X02
     F1 --> X03
 
-    A ==>|"left"| X21
-    A ==>|"left"| X11
-    A ==>|"left"| X01
+    A43 ==>|"left"| X21
+    A32 ==>|"left"| X11
+    A21 ==>|"left"| X01
     A ==>|"center"| X12
     A ==>|"center"| X02
     DA ==>|"center"| X12
@@ -179,7 +189,7 @@ flowchart TB
 
     class RGB,QE,Q,E1,E2,E3,E4,DQE,DQ image;
     class SD,RESIZE,KE,K,DKE,DK depth;
-    class A,DA attention;
+    class A,DA,A21,A32,A43 attention;
     class V1,V2,V3,V4 value;
     class F1,F2,F3,F4,X21,X11,X01,X12,X02,X03,HEAD,ADD,OUT output;
 ```
@@ -198,12 +208,18 @@ V₄ = value_projection₄(X₄)          # independent weights
 
 Fᵢ = GroupNorm(Xᵢ + output_projectionᵢ(Aenc · Vᵢ))
 
+A21 = softmax(Q(F₁↓F₂) K(F₂)ᵀ / √E21)
+A32 = softmax(Q(F₂↓F₃) K(F₃)ᵀ / √E32)
+A43 = softmax(Q(F₃↓F₄) K(F₄)ᵀ / √E43)
+
 Qdec = decoder_image_embedding(RGB)          # independent decoder Q weights
 Kdec = decoder_depth_embedding(resized_depth)# independent decoder K weights
 Adec = softmax(Qdec Kdecᵀ / √Edec)           # decoder matrix, computed once
 
 Cᵢⱼ = concat(upsample(Xᵢ₊₁,ⱼ₋₁), Xᵢ,₀, ..., Xᵢ,ⱼ₋₁)
-Left(C) = GroupNorm(C + Wenc(Aenc · Venc(C)))
+Left₀(C) = GroupNorm(C + W21(A21 · V21(C)))
+Left₁(C) = GroupNorm(C + W32(A32 · V32(C)))
+Left₂(C) = GroupNorm(C + W43(A43 · V43(C)))
 Right(C) = GroupNorm(C + Wdec(Adec · Vdec(C)))
 Center(C) = GroupNorm(C + α Wenc(Aenc · Venc(C))
                          + β Wdec(Adec · Vdec(C)))
@@ -214,9 +230,10 @@ Xᵢⱼ = DoubleConvᵢⱼ(Route(Cᵢⱼ))
 Encoder channel widths follow `C → 2C → 4C → 8C`, where `C` is
 `model.base_channels`. Dense UNet++ skip paths connect every earlier node at a
 resolution to the next nested decoder node. Attention value projections use
-`model.attention_channels`. With
-`model.decoder_attention: false`, the left and center columns use `Aenc` and
-the right node runs without attention fusion.
+`model.attention_channels`. `model.max_attention_tokens` caps the embedding
+length for every Q/K matrix. With `model.decoder_attention: false`, adjacent
+encoder-pair attention still drives the left column, the center uses `Aenc`,
+and the right node runs without attention fusion.
 
 The nested decoder changes parameter names and concatenation widths, so
 checkpoints from the earlier plain U-Net are not compatible. Train this

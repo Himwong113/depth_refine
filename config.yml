@@ -7,7 +7,7 @@ model:
   base_channels: 32
   attention_channels: 32
 
-  # Maximum flattened spatial embedding E used to create the shared QK^T.
+  # Maximum flattened spatial embedding E for RGB/depth and adjacent-stage QK^T.
   max_attention_tokens: 512
   attention_dropout: 0.0
 

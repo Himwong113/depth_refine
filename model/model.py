@@ -2,9 +2,9 @@
 
 The model accepts an RGB image and a (possibly lower-resolution) sparse depth
 map. Independent encoder and decoder channel-attention matrices are computed
-from image queries and interpolated-depth keys. The encoder matrix is shared by
-all encoder stages and routed through the left nested branch. The decoder matrix
-is routed through the right branch, while center nodes learn to mix both.
+from image queries and interpolated-depth keys. Encoder stages also produce
+three adjacent-stage feature attention matrices for the left nested decoder
+branch. The RGB/depth matrices are routed through the center and right branches.
 Every location has its own value projection.
 
 Tensor shapes
@@ -28,6 +28,7 @@ __all__ = [
     "DownBlock",
     "UpBlock",
     "SharedQKAttention",
+    "FeaturePairQKAttention",
     "AttentionValueFusion",
     "DualAttentionValueFusion",
     "DepthRefinementUNet",
@@ -201,6 +202,105 @@ class SharedQKAttention(nn.Module):
         return self.dropout(attention)
 
 
+class FeaturePairQKAttention(nn.Module):
+    """Compute channel attention between two adjacent encoder feature stages.
+
+    The shallower feature supplies ``Q`` and is spatially pooled to the deeper
+    feature's resolution. The deeper feature supplies ``K``. Both projections
+    are then pooled with the same spatial size so their flattened embedding
+    dimension ``E`` matches. The result has shape ``(B, C_attn, C_attn)``.
+    """
+
+    def __init__(
+        self,
+        query_channels: int,
+        key_channels: int,
+        attention_channels: int,
+        max_tokens: int = 1024,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        if query_channels <= 0 or key_channels <= 0 or attention_channels <= 0:
+            raise ValueError("query, key, and attention channels must be positive")
+        if max_tokens <= 0:
+            raise ValueError("max_tokens must be positive")
+
+        self.query_channels = query_channels
+        self.key_channels = key_channels
+        self.attention_channels = attention_channels
+        self.max_tokens = max_tokens
+        groups = _group_count(attention_channels)
+        self.query_encoder = nn.Sequential(
+            nn.Conv2d(query_channels, attention_channels, 3, padding=1, bias=False),
+            nn.GroupNorm(groups, attention_channels),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(attention_channels, attention_channels, 1, bias=False),
+        )
+        self.key_encoder = nn.Sequential(
+            nn.Conv2d(key_channels, attention_channels, 3, padding=1, bias=False),
+            nn.GroupNorm(groups, attention_channels),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(attention_channels, attention_channels, 1, bias=False),
+        )
+        self.dropout = nn.Dropout(dropout)
+
+    def _pooled_size(self, height: int, width: int) -> tuple[int, int]:
+        if height * width <= self.max_tokens:
+            return height, width
+
+        scale = (self.max_tokens / float(height * width)) ** 0.5
+        pooled_h = max(1, int(height * scale))
+        pooled_w = max(1, int(width * scale))
+        while pooled_h * pooled_w > self.max_tokens:
+            if pooled_h >= pooled_w and pooled_h > 1:
+                pooled_h -= 1
+            elif pooled_w > 1:
+                pooled_w -= 1
+            else:
+                break
+        return pooled_h, pooled_w
+
+    def forward(self, query_features: Tensor, key_features: Tensor) -> Tensor:
+        if query_features.ndim != 4 or key_features.ndim != 4:
+            raise ValueError("query_features and key_features must be BCHW tensors")
+        if query_features.shape[1] != self.query_channels:
+            raise ValueError(
+                f"query_features must have {self.query_channels} channels, "
+                f"got {query_features.shape[1]}"
+            )
+        if key_features.shape[1] != self.key_channels:
+            raise ValueError(
+                f"key_features must have {self.key_channels} channels, "
+                f"got {key_features.shape[1]}"
+            )
+        if query_features.shape[0] != key_features.shape[0]:
+            raise ValueError("query and key batch sizes must match")
+        if query_features.device != key_features.device:
+            raise ValueError("query and key features must be on the same device")
+        if not query_features.is_floating_point() or not key_features.is_floating_point():
+            raise TypeError("query and key features must be floating-point tensors")
+        if query_features.dtype != key_features.dtype:
+            key_features = key_features.to(dtype=query_features.dtype)
+
+        target_size = key_features.shape[-2:]
+        if query_features.shape[-2:] != target_size:
+            query_features = F.adaptive_avg_pool2d(query_features, target_size)
+
+        query = self.query_encoder(query_features)
+        key = self.key_encoder(key_features)
+        pooled_size = self._pooled_size(*target_size)
+        if pooled_size != target_size:
+            query = F.adaptive_avg_pool2d(query, pooled_size)
+            key = F.adaptive_avg_pool2d(key, pooled_size)
+
+        query = query.flatten(2)
+        key = key.flatten(2)
+        scale = query.shape[-1] ** -0.5
+        scores = torch.bmm(query, key.transpose(1, 2)) * scale
+        attention = F.softmax(scores.float(), dim=-1).to(dtype=scores.dtype)
+        return self.dropout(attention)
+
+
 class AttentionValueFusion(nn.Module):
     """Apply shared ``QK^T`` attention to one feature tensor's private value.
 
@@ -334,8 +434,8 @@ class DepthRefinementUNet(nn.Module):
         max_attention_tokens: Maximum spatial embedding size ``E`` used for Q/K.
         attention_dropout: Dropout probability for attention and attended values.
         decoder_attention: Compute a second RGB/interpolated-depth ``QK^T``
-            matrix with independent weights. The decoder routes encoder
-            attention left, both matrices through the center, and decoder
+            matrix with independent weights. Adjacent encoder-pair attention is
+            routed left, both RGB/depth matrices through the center, and decoder
             attention right. When disabled, center nodes use encoder attention
             and the right node has no attention fusion.
         residual_output: Add resized sparse depth to the predicted correction.
@@ -403,8 +503,33 @@ class DepthRefinementUNet(nn.Module):
             if decoder_attention
             else None
         )
-        # UNet++ nodes x_level_depth form an attention-routing tree: the left
-        # column uses A_enc, the center uses both, and the right uses A_dec.
+        # Adjacent encoder pairs produce stage-specific attention for the left
+        # UNet++ column. Names follow the paired encoder levels: E2/E1, E3/E2,
+        # and E4/E3.
+        self.encoder_qk_x21 = FeaturePairQKAttention(
+            widths[0],
+            widths[1],
+            attention_channels,
+            max_attention_tokens,
+            attention_dropout,
+        )
+        self.encoder_qk_x32 = FeaturePairQKAttention(
+            widths[1],
+            widths[2],
+            attention_channels,
+            max_attention_tokens,
+            attention_dropout,
+        )
+        self.encoder_qk_x43 = FeaturePairQKAttention(
+            widths[2],
+            widths[3],
+            attention_channels,
+            max_attention_tokens,
+            attention_dropout,
+        )
+
+        # Center nodes mix the RGB/depth encoder and decoder matrices. The
+        # right node uses the decoder matrix.
         self.up2_1 = UpBlock(
             widths[3],
             widths[2],
@@ -490,8 +615,8 @@ class DepthRefinementUNet(nn.Module):
         sparse_depth = self._validate_inputs(image, sparse_depth)
         resized_depth = self._resize_depth(sparse_depth, image.shape[-2:])
         encoder_attention = self.shared_qk(image, resized_depth)
-
-        x0_0 = self.fuse1(self.image_stem(image), encoder_attention)
+        input_image = image + resized_depth
+        x0_0 = self.fuse1(self.image_stem(input_image), encoder_attention)
         x1_0 = self.fuse2(self.image_down1(x0_0), encoder_attention)
         x2_0 = self.fuse3(self.image_down2(x1_0), encoder_attention)
         x3_0 = self.fuse4(self.image_down3(x2_0), encoder_attention)
@@ -506,10 +631,14 @@ class DepthRefinementUNet(nn.Module):
             if decoder_attention is not None
             else encoder_attention
         )
+        encoder_attention_x21 = self.encoder_qk_x21(x0_0, x1_0)
+        encoder_attention_x32 = self.encoder_qk_x32(x1_0, x2_0)
+        encoder_attention_x43 = self.encoder_qk_x43(x2_0, x3_0)
 
-        x2_1 = self.up2_1(x3_0, x2_0, encoder_attention)
-        x1_1 = self.up1_1(x2_0, x1_0, encoder_attention)
-        x0_1 = self.up0_1(x1_0, x0_0, encoder_attention)
+        # Match each decoder node to the encoder pair at the same resolution.
+        x2_1 = self.up2_1(x3_0, x2_0, encoder_attention_x43)
+        x1_1 = self.up1_1(x2_0, x1_0, encoder_attention_x32)
+        x0_1 = self.up0_1(x1_0, x0_0, encoder_attention_x21)
         x1_2 = self.up1_2(x2_1, (x1_0, x1_1), center_attention)
         x0_2 = self.up0_2(x1_1, (x0_0, x0_1), center_attention)
         x0_3 = self.up0_3(x1_2, (x0_0, x0_1, x0_2), decoder_attention)

@@ -247,7 +247,7 @@ def render() -> None:
     ax.text(
         10.5,
         11.25,
-        "Tree-routed attention: encoder left, learned dual center, decoder right",
+        "Adjacent-stage attention left, learned RGB/depth dual center, decoder right",
         ha="center",
         va="center",
         fontsize=11,
@@ -301,9 +301,9 @@ def render() -> None:
         )
         return (x, y, 1.85, 1.15)
 
-    x21 = nested_node(10.65, 2.30, "X₂,₁", "4C", "private V + A_enc")
-    x11 = nested_node(10.65, 3.90, "X₁,₁", "2C", "private V + A_enc")
-    x01 = nested_node(10.65, 5.50, "X₀,₁", "C", "private V + A_enc")
+    x21 = nested_node(10.65, 2.30, "X₂,₁", "4C", "private V + A₄₃")
+    x11 = nested_node(10.65, 3.90, "X₁,₁", "2C", "private V + A₃₂")
+    x01 = nested_node(10.65, 5.50, "X₀,₁", "C", "private V + A₂₁")
     x12 = nested_node(13.25, 3.90, "X₁,₂", "2C", "learned A_enc / A_dec mix")
     x02 = nested_node(13.25, 5.50, "X₀,₂", "C", "learned A_enc / A_dec mix")
     x03 = nested_node(15.85, 5.50, "X₀,₃", "C", "private V + A_dec")
@@ -348,13 +348,14 @@ def render() -> None:
 
     ax.text(13.65, 6.88, "dense same-resolution skips", ha="center", fontsize=7.2, color=MUTED)
 
-    # Shared attention buses (one matrix reused within each side).
+    # RGB/depth attention buses. Left nodes instead use their adjacent encoder
+    # pair: A43 for X2,1, A32 for X1,1, and A21 for X0,1.
     ax.plot([2.15, 14.20], [7.75, 7.75], color=ENC_EDGE, linewidth=1.4, linestyle="--", zorder=1)
     arrow(ax, (6.90, 8.35), (6.90, 7.75), color=ENC_EDGE, dashed=True)
-    for stage_box in (e1, e2, e3, e4, x21, x11, x01, x12, x02):
+    for stage_box in (e1, e2, e3, e4, x12, x02):
         cx = stage_box[0] + stage_box[2] / 2
         arrow(ax, (cx, 7.75), (cx, stage_box[1] + stage_box[3]), color=ENC_EDGE, dashed=True, linewidth=1.1)
-    ax.text(7.30, 7.90, "A_enc → encoder + left + center", fontsize=7.4, color=ENC_EDGE, fontweight="bold")
+    ax.text(7.30, 7.90, "A_enc → encoder + center  |  A21/A32/A43 → left", fontsize=7.4, color=ENC_EDGE, fontweight="bold")
 
     ax.plot([10.95, 17.15], [7.35, 7.35], color=DEC_EDGE, linewidth=1.4, linestyle="--", zorder=1)
     arrow(ax, (13.40, 8.35), (13.40, 7.35), color=DEC_EDGE, dashed=True)
@@ -393,7 +394,7 @@ def render() -> None:
         0.18,
         7.30,
         0.58,
-        "Tree fusion: left A_enc · V  |  center α(A_enc · V_enc) + β(A_dec · V_dec)  |  right A_dec · V",
+        "Tree fusion: left A_pair · V  |  center α(A_enc · V_enc) + β(A_dec · V_dec)  |  right A_dec · V",
         face="#FAF7E8",
         edge="#B89A2C",
         fontsize=6.8,

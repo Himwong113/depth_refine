@@ -8,6 +8,7 @@ from .model import (
     DualAttentionValueFusion,
     DoubleConv,
     DownBlock,
+    FeaturePairQKAttention,
     SharedQKAttention,
     UpBlock,
 )
@@ -20,6 +21,7 @@ __all__ = [
     "DualAttentionValueFusion",
     "DoubleConv",
     "DownBlock",
+    "FeaturePairQKAttention",
     "SharedQKAttention",
     "UpBlock",
 ]
