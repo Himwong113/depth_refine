@@ -16,7 +16,7 @@ model:
   decoder_attention: true
 
   # Predict a correction on top of the interpolated sparse depth.
-  residual_output: true
+  residual_output: false
   # Required by the logarithmic scale-invariant training loss.
   positive_output: true
   depth_interpolation: bilinear
