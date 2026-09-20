@@ -38,10 +38,18 @@ def create_depth_comparison_figure(
         rgb = rgb * standard_deviation + mean
     rgb = np.clip(rgb.transpose(1, 2, 0), 0.0, 1.0)
 
-    sparse = batch["sparse_depth"][sample_index, 0].cpu().float().numpy()
-    sparse_valid = (
-        batch["sparse_valid_mask"][sample_index, 0].cpu().numpy().astype(bool)
-    )
+    if "tof_features" in batch:
+        sparse = batch["tof_features"][sample_index, 0].cpu().float().numpy()
+        sparse_valid = (
+            batch["tof_features"][sample_index, 2].cpu().numpy() > 0.5
+        )
+        sparse_title = "Calibrated ToF depth"
+    else:
+        sparse = batch["sparse_depth"][sample_index, 0].cpu().float().numpy()
+        sparse_valid = (
+            batch["sparse_valid_mask"][sample_index, 0].cpu().numpy().astype(bool)
+        )
+        sparse_title = "Sparse ToF depth (8×8)"
     refined = prediction[sample_index, 0].detach().cpu().float().numpy()
     target = batch["target_depth"][sample_index, 0].cpu().float().numpy()
     target_valid = (
@@ -80,7 +88,7 @@ def create_depth_comparison_figure(
         vmax=display_depth_max,
         interpolation="nearest",
     )
-    axes[1].set_title("Sparse ToF depth (8×8)")
+    axes[1].set_title(sparse_title)
     axes[2].imshow(
         refined_display,
         cmap=colormap,

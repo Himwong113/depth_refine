@@ -52,7 +52,7 @@ def main() -> None:
         default=DEFAULT_CONFIG_PATH,
         help=f"YAML configuration path (default: {DEFAULT_CONFIG_PATH})",
     )
-    parser.add_argument("--split", choices=("train", "test", "all"))
+    parser.add_argument("--split", choices=("train", "val", "test", "all"))
     parser.add_argument("--device", help="auto, cpu, cuda, cuda:0, or mps")
     parser.add_argument("--max-batches", type=int)
     parser.add_argument(
@@ -118,6 +118,14 @@ def main() -> None:
     print(f"Split: {data_options['split']} ({len(data_loader.dataset):,} samples)")
     print(f"Masked MAE:  {metrics['mae']:.6f} m")
     print(f"Masked RMSE: {metrics['rmse']:.6f} m")
+    for label, key in (
+        ("0–2 m", "rmse_0_2m"),
+        ("2–4 m", "rmse_2_4m"),
+        ("4–6 m", "rmse_4_6m"),
+        ("6+ m", "rmse_6_infm"),
+    ):
+        if key in metrics:
+            print(f"RMSE {label:>5}: {metrics[key]:.6f} m")
     if visualizer is not None:
         print(
             f"Visualizations: {visualizer.saved_images} saved to "

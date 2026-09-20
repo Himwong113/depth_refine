@@ -1,25 +1,21 @@
 """PyTorch models for RGB-guided depth refinement."""
 
 from .model import (
-    AttentionValueFusion,
+    ConvNormAct,
     DepthRefineNet,
     DepthRefinementModel,
     DepthRefinementUNet,
-    DualAttentionValueFusion,
-    DoubleConv,
-    DownBlock,
-    SharedQKAttention,
-    UpBlock,
+    DepthwiseSeparableBlock,
+    GeometryAwareToFAttention,
+    LiteDecoderBlock,
 )
 
 __all__ = [
-    "AttentionValueFusion",
+    "ConvNormAct",
     "DepthRefineNet",
     "DepthRefinementModel",
     "DepthRefinementUNet",
-    "DualAttentionValueFusion",
-    "DoubleConv",
-    "DownBlock",
-    "SharedQKAttention",
-    "UpBlock",
+    "DepthwiseSeparableBlock",
+    "GeometryAwareToFAttention",
+    "LiteDecoderBlock",
 ]

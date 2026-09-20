@@ -164,17 +164,29 @@ def evaluate(
     valid_pixel_count = 0
     loss_sum = 0.0
     completed_batches = 0
+    depth_bins = ((0.0, 2.0), (2.0, 4.0), (4.0, 6.0), (6.0, float("inf")))
+    bin_squared_error = {bounds: 0.0 for bounds in depth_bins}
+    bin_pixel_count = {bounds: 0 for bounds in depth_bins}
 
     with torch.inference_mode():
         for batch_index, batch in enumerate(data_loader):
             if max_batches is not None and batch_index >= max_batches:
                 break
             image = batch["image"].to(device, non_blocking=True)
-            sparse_depth = batch["sparse_depth"].to(device, non_blocking=True)
+            tof_features = batch.get("tof_features", batch["sparse_depth"]).to(
+                device, non_blocking=True
+            )
+            tof_tokens = batch.get("tof_tokens")
+            if tof_tokens is not None:
+                tof_tokens = tof_tokens.to(device, non_blocking=True)
             target = batch["target_depth"].to(device, non_blocking=True)
             valid_mask = batch["target_valid_mask"].to(device, non_blocking=True).bool()
 
-            prediction = model(image, sparse_depth)
+            prediction = (
+                model(image, tof_features)
+                if tof_tokens is None
+                else model(image, tof_features, tof_tokens)
+            )
             if prediction_callback is not None:
                 prediction_callback(batch, prediction, batch_index)
             if loss_config is not None:
@@ -191,9 +203,14 @@ def evaluate(
             completed_batches += 1
             valid_mask &= torch.isfinite(prediction) & torch.isfinite(target)
             error = prediction[valid_mask] - target[valid_mask]
+            valid_targets = target[valid_mask]
             absolute_error_sum += error.abs().sum().item()
             squared_error_sum += error.square().sum().item()
             valid_pixel_count += error.numel()
+            for lower, upper in depth_bins:
+                in_bin = (valid_targets >= lower) & (valid_targets < upper)
+                bin_squared_error[(lower, upper)] += error[in_bin].square().sum().item()
+                bin_pixel_count[(lower, upper)] += int(in_bin.sum().item())
 
     if valid_pixel_count == 0:
         raise RuntimeError("validation produced no valid target-depth pixels")
@@ -203,6 +220,13 @@ def evaluate(
     }
     if loss_config is not None:
         metrics["loss"] = loss_sum / completed_batches
+    for lower, upper in depth_bins:
+        count = bin_pixel_count[(lower, upper)]
+        if count:
+            upper_label = "inf" if upper == float("inf") else f"{upper:g}"
+            metrics[f"rmse_{lower:g}_{upper_label}m"] = (
+                bin_squared_error[(lower, upper)] / count
+            ) ** 0.5
     return metrics
 
 
@@ -494,7 +518,12 @@ def train_model(
                 break
 
             image = batch["image"].to(device, non_blocking=True)
-            sparse_depth = batch["sparse_depth"].to(device, non_blocking=True)
+            tof_features = batch.get("tof_features", batch["sparse_depth"]).to(
+                device, non_blocking=True
+            )
+            tof_tokens = batch.get("tof_tokens")
+            if tof_tokens is not None:
+                tof_tokens = tof_tokens.to(device, non_blocking=True)
             target = batch["target_depth"].to(device, non_blocking=True)
             valid_mask = batch["target_valid_mask"].to(device, non_blocking=True)
 
@@ -504,7 +533,11 @@ def train_model(
                 dtype=torch.float16,
                 enabled=use_amp,
             ):
-                prediction = model(image, sparse_depth)
+                prediction = (
+                    model(image, tof_features)
+                    if tof_tokens is None
+                    else model(image, tof_features, tof_tokens)
+                )
                 loss = masked_depth_loss(
                     prediction,
                     target,
@@ -570,6 +603,11 @@ def train_model(
                 f"· {validation_split_name} MAE {validation_metrics['mae']:.6f} "
                 f"· {validation_split_name} RMSE {validation_metrics['rmse']:.6f}"
             )
+            if "rmse_6_infm" in validation_metrics:
+                message += (
+                    f" · {validation_split_name} RMSE[6m+] "
+                    f"{validation_metrics['rmse_6_infm']:.6f}"
+                )
         print(message)
 
         if writer is not None:
@@ -583,6 +621,11 @@ def train_model(
                 writer.add_scalar(
                     "Metrics/validation_RMSE", validation_metrics["rmse"], epoch
                 )
+                for metric_name, metric_value in validation_metrics.items():
+                    if metric_name.startswith("rmse_"):
+                        writer.add_scalar(
+                            f"Metrics/depth_bins/{metric_name}", metric_value, epoch
+                        )
                 writer.add_scalar(
                     "Overfitting/validation_minus_train_loss",
                     validation_metrics["loss"] - mean_loss,

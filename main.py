@@ -109,6 +109,10 @@ def print_batch_summary(data_loader: Any) -> None:
     print(f"Split: {dataset.split} ({len(dataset):,} samples)")
     print(f"Image batch:              {tuple(batch['image'].shape)}")
     print(f"Sparse depth batch:       {tuple(batch['sparse_depth'].shape)}")
+    if "tof_features" in batch:
+        print(f"Calibrated ToF features:  {tuple(batch['tof_features'].shape)}")
+    if "tof_tokens" in batch:
+        print(f"Calibrated ToF tokens:    {tuple(batch['tof_tokens'].shape)}")
     print(f"High-resolution depth:    {tuple(batch['target_depth'].shape)}")
     print(f"High-resolution validity: {tuple(batch['target_valid_mask'].shape)}")
     print(f"Sparse validity:          {tuple(batch['sparse_valid_mask'].shape)}")
@@ -135,7 +139,7 @@ def main() -> None:
 
     config = load_config(arguments.config)
     model = build_model(config)
-   
+
     print_model_summary(
         model,
         arguments.config,
@@ -155,4 +159,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
- 

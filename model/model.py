@@ -1,35 +1,21 @@
-"""Depth refinement network.
+"""Compact RGB/ToF depth refinement network.
 
-The model accepts an RGB image and a (possibly lower-resolution) sparse depth
-map. Independent encoder and decoder channel-attention matrices are computed
-from image queries and interpolated-depth keys. The encoder matrix is shared by
-all encoder stages and routed through the left nested branch. The decoder matrix
-is routed through the right branch, while center nodes learn to mix both.
-Every location has its own value projection.
-
-Tensor shapes
--------------
-``image``: ``(B, 3, H, W)``
-``sparse_depth``: ``(B, 1, Hd, Wd)`` or ``(B, Hd, Wd)``
-output: ``(B, 1, H, W)``
+The network consumes normalized RGB and calibrated ToF observations. RGB
+bottleneck features query the 64 sensor zones through a very small geometric
+cross-attention block before the lightweight decoder runs.
 """
 
 from __future__ import annotations
-
-from typing import Tuple
 
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
 
-
 __all__ = [
-    "DoubleConv",
-    "DownBlock",
-    "UpBlock",
-    "SharedQKAttention",
-    "AttentionValueFusion",
-    "DualAttentionValueFusion",
+    "ConvNormAct",
+    "DepthwiseSeparableBlock",
+    "GeometryAwareToFAttention",
+    "LiteDecoderBlock",
     "DepthRefinementUNet",
     "DepthRefinementModel",
     "DepthRefineNet",
@@ -37,491 +23,463 @@ __all__ = [
 
 
 def _group_count(channels: int, maximum: int = 8) -> int:
-    """Return the largest useful GroupNorm group count for ``channels``."""
-
     for groups in range(min(maximum, channels), 0, -1):
         if channels % groups == 0:
             return groups
     return 1
 
 
-class DoubleConv(nn.Module):
-    """Two 3x3 convolutions with GroupNorm and SiLU activations."""
-
-    def __init__(self, in_channels: int, out_channels: int) -> None:
-        super().__init__()
-        groups = _group_count(out_channels)
-        self.block = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(groups, out_channels),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(groups, out_channels),
-            nn.SiLU(inplace=True),
-        )
-
-    def forward(self, x: Tensor) -> Tensor:
-        return self.block(x)
-
-
-class DownBlock(nn.Module):
-    """Halve spatial resolution, then apply a :class:`DoubleConv`."""
-
-    def __init__(self, in_channels: int, out_channels: int) -> None:
-        super().__init__()
-        self.block = nn.Sequential(nn.MaxPool2d(2), DoubleConv(in_channels, out_channels))
-
-    def forward(self, x: Tensor) -> Tensor:
-        return self.block(x)
-
-
-class UpBlock(nn.Module):
-    """Attend and refine an upsampled feature with one or more dense skips."""
+class ConvNormAct(nn.Sequential):
+    """Convolution followed by GroupNorm and SiLU."""
 
     def __init__(
         self,
         in_channels: int,
-        skip_channels: int,
         out_channels: int,
-        attention_channels: int | None = None,
-        attention_dropout: float = 0.0,
-        dual_attention: bool = False,
+        kernel_size: int = 1,
+        stride: int = 1,
     ) -> None:
+        padding = kernel_size // 2
+        super().__init__(
+            nn.Conv2d(
+                in_channels,
+                out_channels,
+                kernel_size,
+                stride=stride,
+                padding=padding,
+                bias=False,
+            ),
+            nn.GroupNorm(_group_count(out_channels), out_channels),
+            nn.SiLU(inplace=True),
+        )
+
+
+class DepthwiseSeparableBlock(nn.Module):
+    """Mobile-friendly spatial filtering with an optional residual path."""
+
+    def __init__(self, in_channels: int, out_channels: int, stride: int = 1) -> None:
         super().__init__()
-        concatenated_channels = in_channels + skip_channels
-        self.dual_attention = dual_attention and attention_channels is not None
-        fusion_type = (
-            DualAttentionValueFusion if self.dual_attention else AttentionValueFusion
+        self.use_residual = stride == 1 and in_channels == out_channels
+        self.block = nn.Sequential(
+            nn.Conv2d(
+                in_channels,
+                in_channels,
+                kernel_size=3,
+                stride=stride,
+                padding=1,
+                groups=in_channels,
+                bias=False,
+            ),
+            nn.GroupNorm(_group_count(in_channels), in_channels),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
+            nn.GroupNorm(_group_count(out_channels), out_channels),
+            nn.SiLU(inplace=True),
         )
-        self.attention_fusion = (
-            fusion_type(
-                concatenated_channels,
-                attention_channels,
-                attention_dropout,
-            )
-            if attention_channels is not None
-            else None
+
+    def forward(self, x: Tensor) -> Tensor:
+        output = self.block(x)
+        return output + x if self.use_residual else output
+
+
+class ChannelContext(nn.Module):
+    """Cheap bottleneck channel context."""
+
+    def __init__(self, channels: int, reduction: int = 4) -> None:
+        super().__init__()
+        hidden_channels = max(8, channels // reduction)
+        self.gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, hidden_channels, 1),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(hidden_channels, channels, 1),
+            nn.Sigmoid(),
         )
-        self.conv = DoubleConv(concatenated_channels, out_channels)
 
-    def forward(
-        self,
-        x: Tensor,
-        skip: Tensor | tuple[Tensor, ...],
-        shared_attention: Tensor | tuple[Tensor, Tensor] | None = None,
-    ) -> Tensor:
-        skips = (skip,) if isinstance(skip, Tensor) else skip
-        if not skips:
-            raise ValueError("at least one skip tensor is required")
-        target_size = skips[0].shape[-2:]
-        if any(feature.shape[-2:] != target_size for feature in skips[1:]):
-            raise ValueError("all skip tensors must have the same spatial size")
-
-        # An explicit target size also handles odd input heights and widths.
-        x = F.interpolate(x, size=target_size, mode="bilinear", align_corners=False)
-        concatenated = torch.cat((x, *skips), dim=1)
-        if self.attention_fusion is not None:
-            if shared_attention is None:
-                raise ValueError("shared_attention is required for attention fusion")
-            if self.dual_attention:
-                if not isinstance(shared_attention, tuple) or len(shared_attention) != 2:
-                    raise ValueError("dual attention requires (encoder, decoder) matrices")
-            elif isinstance(shared_attention, tuple):
-                raise ValueError("single attention requires one attention matrix")
-            concatenated = self.attention_fusion(concatenated, shared_attention)
-        return self.conv(concatenated)
+    def forward(self, x: Tensor) -> Tensor:
+        return x * self.gate(x)
 
 
-class SharedQKAttention(nn.Module):
-    """Compute one RGB/depth channel-attention matrix.
+class GeometryAwareToFAttention(nn.Module):
+    """Condition coarse RGB features on sparse calibrated ToF zone tokens."""
 
-    The image branch produces ``Q`` and the resized-depth branch produces
-    ``K``.  After flattening the spatial embedding dimension ``E``, their
-    shapes are ``(B, C_attn, E)`` and the returned ``QK^T`` attention has shape
-    ``(B, C_attn, C_attn)``.  Pooling limits ``E`` without changing that shared
-    attention shape.
-    """
+    token_dim = 7
 
     def __init__(
         self,
-        image_channels: int,
-        attention_channels: int,
-        max_tokens: int = 1024,
-        dropout: float = 0.0,
+        feature_channels: int,
+        attention_dim: int = 16,
+        num_heads: int = 2,
+        depth_scale: float = 10.0,
     ) -> None:
         super().__init__()
-        if image_channels <= 0 or attention_channels <= 0:
-            raise ValueError("image_channels and attention_channels must be positive")
-        if max_tokens <= 0:
-            raise ValueError("max_tokens must be positive")
+        if attention_dim <= 0:
+            raise ValueError("attention_dim must be positive")
+        if num_heads <= 0 or attention_dim % num_heads != 0:
+            raise ValueError("attention_dim must be divisible by num_heads")
+        if depth_scale <= 0:
+            raise ValueError("depth_scale must be positive")
 
-        self.attention_channels = attention_channels
-        self.max_tokens = max_tokens
-        groups = _group_count(attention_channels)
-        self.query_encoder = nn.Sequential(
-            nn.Conv2d(image_channels, attention_channels, 3, padding=1, bias=False),
-            nn.GroupNorm(groups, attention_channels),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(attention_channels, attention_channels, 1, bias=False),
+        self.attention_dim = attention_dim
+        self.num_heads = num_heads
+        self.head_dim = attention_dim // num_heads
+        self.depth_scale = float(depth_scale)
+        self.feature_norm = nn.GroupNorm(
+            _group_count(feature_channels), feature_channels
         )
-        self.key_encoder = nn.Sequential(
-            nn.Conv2d(1, attention_channels, 3, padding=1, bias=False),
-            nn.GroupNorm(groups, attention_channels),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(attention_channels, attention_channels, 1, bias=False),
+        self.query_projection = nn.Conv2d(
+            feature_channels, attention_dim, kernel_size=1, bias=False
         )
-        self.dropout = nn.Dropout(dropout)
-
-    def _pool(self, features: Tensor) -> Tensor:
-        height, width = features.shape[-2:]
-        if height * width <= self.max_tokens:
-            return features
-
-        scale = (self.max_tokens / float(height * width)) ** 0.5
-        pooled_h = max(1, int(height * scale))
-        pooled_w = max(1, int(width * scale))
-        while pooled_h * pooled_w > self.max_tokens:
-            if pooled_h >= pooled_w and pooled_h > 1:
-                pooled_h -= 1
-            elif pooled_w > 1:
-                pooled_w -= 1
-            else:
-                break
-        return F.adaptive_avg_pool2d(features, (pooled_h, pooled_w))
-
-    def forward(self, image: Tensor, resized_depth: Tensor) -> Tensor:
-        query = self._pool(self.query_encoder(image)).flatten(2)
-        key = self._pool(self.key_encoder(resized_depth)).flatten(2)
-        if query.shape[-1] != key.shape[-1]:
-            raise RuntimeError("query and key embedding sizes must match")
-
-        scale = query.shape[-1] ** -0.5
-        scores = torch.bmm(query, key.transpose(1, 2)) * scale
-        attention = F.softmax(scores.float(), dim=-1).to(dtype=scores.dtype)
-        return self.dropout(attention)
-
-
-class AttentionValueFusion(nn.Module):
-    """Apply shared ``QK^T`` attention to one feature tensor's private value.
-
-    Every instance owns a separate value projection, so encoder and decoder
-    locations compute ``V_i`` independently while reusing one attention matrix.
-    """
-
-    def __init__(
-        self,
-        stage_channels: int,
-        attention_channels: int,
-        dropout: float = 0.0,
-    ) -> None:
-        super().__init__()
-        if stage_channels <= 0 or attention_channels <= 0:
-            raise ValueError("stage_channels and attention_channels must be positive")
-
-        self.stage_channels = stage_channels
-        self.attention_channels = attention_channels
-        self.value_projection = nn.Conv2d(
-            stage_channels, attention_channels, kernel_size=1, bias=False
+        self.token_projection = nn.Linear(
+            self.token_dim, attention_dim * 2, bias=False
         )
         self.output_projection = nn.Conv2d(
-            attention_channels, stage_channels, kernel_size=1, bias=False
+            attention_dim, feature_channels, kernel_size=1, bias=False
         )
-        self.dropout = nn.Dropout2d(dropout)
-        self.norm = nn.GroupNorm(_group_count(stage_channels), stage_channels)
 
-    def forward(self, features: Tensor, shared_attention: Tensor) -> Tensor:
-        batch, _, height, width = features.shape
-        expected = (batch, self.attention_channels, self.attention_channels)
-        if tuple(shared_attention.shape) != expected:
-            raise ValueError(
-                f"shared_attention must have shape {expected}, "
-                f"got {tuple(shared_attention.shape)}"
-            )
+        # softplus keeps each head's geometric falloff positive. The small
+        # residual scale starts training close to the RGB-only representation
+        # while still allowing gradients into every attention projection.
+        self.geometry_scale = nn.Parameter(torch.full((num_heads,), 4.0))
+        self.residual_scale = nn.Parameter(torch.tensor(0.01))
 
-        value = self.value_projection(features).flatten(2)
-        attended = torch.bmm(shared_attention, value)
-        attended = attended.reshape(batch, self.attention_channels, height, width)
-        attended = self.dropout(self.output_projection(attended))
-        return self.norm(features + attended)
+    @staticmethod
+    def _query_positions(
+        height: int,
+        width: int,
+        reference: Tensor,
+    ) -> Tensor:
+        y = (torch.arange(height, device=reference.device, dtype=reference.dtype) + 0.5)
+        x = (torch.arange(width, device=reference.device, dtype=reference.dtype) + 0.5)
+        y = y / height
+        x = x / width
+        grid_y, grid_x = torch.meshgrid(y, x, indexing="ij")
+        return torch.stack((grid_y, grid_x), dim=-1).reshape(1, height * width, 1, 2)
 
+    def _normalize_tokens(self, tof_tokens: Tensor) -> tuple[Tensor, Tensor]:
+        measurements_are_valid = (
+            torch.isfinite(tof_tokens[..., :2]).all(dim=-1)
+            & (tof_tokens[..., 0] > 0)
+            & (tof_tokens[..., 1] >= 0)
+        )
+        geometry_is_valid = (
+            torch.isfinite(tof_tokens[..., 3:7]).all(dim=-1)
+            & (tof_tokens[..., 5] > 0)
+            & (tof_tokens[..., 6] > 0)
+        )
+        valid = (
+            torch.isfinite(tof_tokens[..., 2])
+            & (tof_tokens[..., 2] > 0.5)
+            & measurements_are_valid
+            & geometry_is_valid
+        )
+        clean_tokens = torch.nan_to_num(
+            tof_tokens, nan=0.0, posinf=0.0, neginf=0.0
+        )
+        valid_value = valid.unsqueeze(-1).to(dtype=clean_tokens.dtype)
+        measurements = clean_tokens[..., :2].clamp_min(0)
+        measurements = measurements / self.depth_scale * valid_value
+        geometry = clean_tokens[..., 3:7].clamp(0, 1)
+        normalized = torch.cat((measurements, valid_value, geometry), dim=-1)
+        return normalized, valid
 
-class DualAttentionValueFusion(nn.Module):
-    """Merge encoder and decoder attention through parallel learned branches.
-
-    Both branches own private value/output projections. A learned softmax gate,
-    initialized to an equal mixture, combines their attended features before a
-    single residual addition and normalization.
-    """
-
-    def __init__(
+    def _attention(
         self,
-        stage_channels: int,
-        attention_channels: int,
-        dropout: float = 0.0,
-    ) -> None:
+        rgb_features: Tensor,
+        tof_tokens: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        batch_size, _, height, width = rgb_features.shape
+        normalized_tokens, valid = self._normalize_tokens(tof_tokens)
+
+        queries = self.query_projection(self.feature_norm(rgb_features))
+        queries = queries.flatten(2).transpose(1, 2)
+        queries = queries.reshape(
+            batch_size, height * width, self.num_heads, self.head_dim
+        ).permute(0, 2, 1, 3)
+
+        key_values = self.token_projection(normalized_tokens)
+        key_values = key_values.reshape(
+            batch_size,
+            tof_tokens.shape[1],
+            2,
+            self.num_heads,
+            self.head_dim,
+        )
+        keys, values = key_values.unbind(dim=2)
+        keys = keys.permute(0, 2, 1, 3)
+        values = values.permute(0, 2, 1, 3)
+
+        # A zero-valued null token is always available. It makes an all-invalid
+        # sensor frame safe and lets attention explicitly ignore poor ToF data.
+        null_token = keys.new_zeros(batch_size, self.num_heads, 1, self.head_dim)
+        keys = torch.cat((keys, null_token), dim=2)
+        values = torch.cat((values, null_token), dim=2)
+
+        logits = torch.matmul(queries, keys.transpose(-2, -1))
+        logits = logits * (self.head_dim**-0.5)
+
+        query_positions = self._query_positions(height, width, rgb_features)
+        centers = normalized_tokens[:, None, :, 3:5]
+        half_sizes = normalized_tokens[:, None, :, 5:7] * 0.5
+        outside = (query_positions - centers).abs().sub(half_sizes).clamp_min(0)
+        distance_squared = outside.square().sum(dim=-1)
+        geometry_scale = F.softplus(self.geometry_scale).to(dtype=logits.dtype)
+        geometry_bias = -geometry_scale[None, :, None, None] * distance_squared[:, None]
+        geometry_bias = torch.cat(
+            (geometry_bias, geometry_bias.new_zeros(*geometry_bias.shape[:-1], 1)),
+            dim=-1,
+        )
+        logits = logits + geometry_bias
+
+        valid_with_null = torch.cat(
+            (valid, torch.ones(batch_size, 1, dtype=torch.bool, device=valid.device)),
+            dim=1,
+        )
+        logits = logits.masked_fill(
+            ~valid_with_null[:, None, None, :], torch.finfo(logits.dtype).min
+        )
+        weights = F.softmax(logits, dim=-1, dtype=torch.float32).to(values.dtype)
+        attended = torch.matmul(weights, values)
+        return attended, weights
+
+    def forward(self, rgb_features: Tensor, tof_tokens: Tensor) -> Tensor:
+        attended, _ = self._attention(rgb_features, tof_tokens)
+        batch_size, _, height, width = rgb_features.shape
+        attended = attended.permute(0, 2, 1, 3).reshape(
+            batch_size, height * width, self.attention_dim
+        )
+        attended = attended.transpose(1, 2).reshape(
+            batch_size, self.attention_dim, height, width
+        )
+        update = self.output_projection(attended)
+        return rgb_features + self.residual_scale * update
+
+
+class LiteDecoderBlock(nn.Module):
+    """Project, resize, add an encoder skip, and refine."""
+
+    def __init__(self, in_channels: int, skip_channels: int, out_channels: int) -> None:
         super().__init__()
-        if stage_channels <= 0 or attention_channels <= 0:
-            raise ValueError("stage_channels and attention_channels must be positive")
+        self.input_projection = ConvNormAct(in_channels, out_channels)
+        self.skip_projection = ConvNormAct(skip_channels, out_channels)
+        self.refine = DepthwiseSeparableBlock(out_channels, out_channels)
 
-        self.stage_channels = stage_channels
-        self.attention_channels = attention_channels
-        self.encoder_value_projection = nn.Conv2d(
-            stage_channels, attention_channels, kernel_size=1, bias=False
-        )
-        self.decoder_value_projection = nn.Conv2d(
-            stage_channels, attention_channels, kernel_size=1, bias=False
-        )
-        self.encoder_output_projection = nn.Conv2d(
-            attention_channels, stage_channels, kernel_size=1, bias=False
-        )
-        self.decoder_output_projection = nn.Conv2d(
-            attention_channels, stage_channels, kernel_size=1, bias=False
-        )
-        self.mix_logits = nn.Parameter(torch.zeros(2))
-        self.dropout = nn.Dropout2d(dropout)
-        self.norm = nn.GroupNorm(_group_count(stage_channels), stage_channels)
-
-    def _attend(
-        self,
-        features: Tensor,
-        attention: Tensor,
-        value_projection: nn.Conv2d,
-        output_projection: nn.Conv2d,
-    ) -> Tensor:
-        batch, _, height, width = features.shape
-        expected = (batch, self.attention_channels, self.attention_channels)
-        if tuple(attention.shape) != expected:
-            raise ValueError(
-                f"attention must have shape {expected}, got {tuple(attention.shape)}"
-            )
-        value = value_projection(features).flatten(2)
-        attended = torch.bmm(attention, value).reshape(
-            batch, self.attention_channels, height, width
-        )
-        return output_projection(attended)
-
-    def forward(
-        self,
-        features: Tensor,
-        shared_attention: tuple[Tensor, Tensor],
-    ) -> Tensor:
-        encoder_attention, decoder_attention = shared_attention
-        encoder_features = self._attend(
-            features,
-            encoder_attention,
-            self.encoder_value_projection,
-            self.encoder_output_projection,
-        )
-        decoder_features = self._attend(
-            features,
-            decoder_attention,
-            self.decoder_value_projection,
-            self.decoder_output_projection,
-        )
-        mix = F.softmax(self.mix_logits, dim=0).to(dtype=features.dtype)
-        attended = mix[0] * encoder_features + mix[1] * decoder_features
-        return self.norm(features + self.dropout(attended))
+    def forward(self, x: Tensor, skip: Tensor) -> Tensor:
+        x = self.input_projection(x)
+        x = F.interpolate(x, size=skip.shape[-2:], mode="bilinear", align_corners=False)
+        return self.refine(x + self.skip_projection(skip))
 
 
 class DepthRefinementUNet(nn.Module):
-    """Nested U-Net (UNet++) with separate encoder and decoder attention.
+    """Compact calibrated-ToF-guided encoder-decoder.
 
-    Args:
-        image_channels: Number of image channels, normally three.
-        base_channels: Width of the first encoder stage.
-        attention_channels: Channel size of the shared ``QK^T`` matrix. Defaults
-            to ``base_channels``.
-        max_attention_tokens: Maximum spatial embedding size ``E`` used for Q/K.
-        attention_dropout: Dropout probability for attention and attended values.
-        decoder_attention: Compute a second RGB/interpolated-depth ``QK^T``
-            matrix with independent weights. The decoder routes encoder
-            attention left, both matrices through the center, and decoder
-            attention right. When disabled, center nodes use encoder attention
-            and the right node has no attention fusion.
-        residual_output: Add resized sparse depth to the predicted correction.
-        positive_output: Apply ``softplus`` to the final prediction.
-        depth_interpolation: Interpolation mode used to resize sparse depth.
+    tof_features contains the raster used for the global metric-scale anchor;
+    tof_tokens optionally supplies the exact 64 calibrated sensor zones for
+    attention. A one-channel low-resolution map remains supported and is
+    converted into approximate tokens for legacy two-input callers.
     """
 
     def __init__(
         self,
         image_channels: int = 3,
         base_channels: int = 32,
-        attention_channels: int | None = None,
-        max_attention_tokens: int = 1024,
-        attention_dropout: float = 0.0,
-        decoder_attention: bool = True,
-        residual_output: bool = False,
-        positive_output: bool = False,
-        depth_interpolation: str = "bilinear",
+        depth_scale: float = 10.0,
+        positive_output: bool = True,
+        attention_dim: int = 16,
+        attention_heads: int = 2,
     ) -> None:
         super().__init__()
         if image_channels <= 0:
             raise ValueError("image_channels must be positive")
-        if base_channels <= 0:
-            raise ValueError("base_channels must be positive")
-        if attention_channels is None:
-            attention_channels = base_channels
-        if attention_channels <= 0:
-            raise ValueError("attention_channels must be positive")
-        if depth_interpolation not in {"nearest", "nearest-exact", "bilinear", "bicubic"}:
-            raise ValueError(f"unsupported depth_interpolation: {depth_interpolation!r}")
+        if base_channels < 8:
+            raise ValueError("base_channels must be at least 8")
+        if depth_scale <= 0:
+            raise ValueError("depth_scale must be positive")
 
         self.image_channels = image_channels
-        self.residual_output = residual_output
+        self.depth_scale = float(depth_scale)
         self.positive_output = positive_output
-        self.depth_interpolation = depth_interpolation
-
-        widths = [base_channels * (2**stage) for stage in range(4)]
-
-        self.shared_qk = SharedQKAttention(
-            image_channels=image_channels,
-            attention_channels=attention_channels,
-            max_tokens=max_attention_tokens,
-            dropout=attention_dropout,
+        widths = (
+            base_channels,
+            base_channels * 2,
+            base_channels * 3,
+            base_channels * 4,
         )
 
-        self.image_stem = DoubleConv(image_channels, widths[0])
-        self.image_down1 = DownBlock(widths[0], widths[1])
-        self.image_down2 = DownBlock(widths[1], widths[2])
-        self.image_down3 = DownBlock(widths[2], widths[3])
-
-        # Each stage owns an independent V projection. Only QK^T is shared.
-        self.fuse1 = AttentionValueFusion(widths[0], attention_channels, attention_dropout)
-        self.fuse2 = AttentionValueFusion(widths[1], attention_channels, attention_dropout)
-        self.fuse3 = AttentionValueFusion(widths[2], attention_channels, attention_dropout)
-        self.fuse4 = AttentionValueFusion(widths[3], attention_channels, attention_dropout)
-
-        decoder_attention_channels = attention_channels if decoder_attention else None
-        self.decoder_shared_qk = (
-            SharedQKAttention(
-                image_channels=image_channels,
-                attention_channels=attention_channels,
-                max_tokens=max_attention_tokens,
-                dropout=attention_dropout,
-            )
-            if decoder_attention
-            else None
-        )
-        # UNet++ nodes x_level_depth form an attention-routing tree: the left
-        # column uses A_enc, the center uses both, and the right uses A_dec.
-        self.up2_1 = UpBlock(
+        self.stem = ConvNormAct(image_channels, widths[0], kernel_size=3, stride=2)
+        self.encoder1 = DepthwiseSeparableBlock(widths[0], widths[0])
+        self.down2 = DepthwiseSeparableBlock(widths[0], widths[1], stride=2)
+        self.encoder2 = DepthwiseSeparableBlock(widths[1], widths[1])
+        self.down3 = DepthwiseSeparableBlock(widths[1], widths[2], stride=2)
+        self.encoder3 = DepthwiseSeparableBlock(widths[2], widths[2])
+        self.down4 = DepthwiseSeparableBlock(widths[2], widths[3], stride=2)
+        self.tof_conditioner = GeometryAwareToFAttention(
             widths[3],
-            widths[2],
-            widths[2],
-            attention_channels,
-            attention_dropout,
+            attention_dim=attention_dim,
+            num_heads=attention_heads,
+            depth_scale=self.depth_scale,
         )
-        self.up1_1 = UpBlock(
-            widths[2],
-            widths[1],
-            widths[1],
-            attention_channels,
-            attention_dropout,
+        self.bottleneck = nn.Sequential(
+            DepthwiseSeparableBlock(widths[3], widths[3]),
+            ChannelContext(widths[3]),
         )
-        self.up0_1 = UpBlock(
-            widths[1],
-            widths[0],
-            widths[0],
-            attention_channels,
-            attention_dropout,
-        )
-        self.up1_2 = UpBlock(
-            widths[2],
-            2 * widths[1],
-            widths[1],
-            attention_channels,
-            attention_dropout,
-            dual_attention=decoder_attention,
-        )
-        self.up0_2 = UpBlock(
-            widths[1],
-            2 * widths[0],
-            widths[0],
-            attention_channels,
-            attention_dropout,
-            dual_attention=decoder_attention,
-        )
-        self.up0_3 = UpBlock(
-            widths[1],
-            3 * widths[0],
-            widths[0],
-            decoder_attention_channels,
-            attention_dropout,
-        )
-        self.output_head = nn.Conv2d(widths[0], 1, kernel_size=1)
 
-    def _resize_depth(self, depth: Tensor, size: Tuple[int, int]) -> Tensor:
-        if depth.shape[-2:] == size:
-            return depth
-        if self.depth_interpolation in {"bilinear", "bicubic"}:
-            return F.interpolate(
-                depth, size=size, mode=self.depth_interpolation, align_corners=False
-            )
-        return F.interpolate(depth, size=size, mode=self.depth_interpolation)
+        self.decoder3 = LiteDecoderBlock(widths[3], widths[2], widths[2])
+        self.decoder2 = LiteDecoderBlock(widths[2], widths[1], widths[1])
+        self.decoder1 = LiteDecoderBlock(widths[1], widths[0], widths[0])
+        self.full_refine = DepthwiseSeparableBlock(
+            widths[0] + image_channels, widths[0]
+        )
+        self.depth_head = nn.Conv2d(widths[0], 1, kernel_size=1)
 
-    def _validate_inputs(self, image: Tensor, sparse_depth: Tensor) -> Tensor:
-        if image.ndim != 4:
-            raise ValueError(f"image must have shape (B, C, H, W), got {tuple(image.shape)}")
-        if image.shape[1] != self.image_channels:
+    @staticmethod
+    def _normalized_resize(
+        depth: Tensor,
+        valid: Tensor,
+        size: tuple[int, int],
+    ) -> tuple[Tensor, Tensor]:
+        weighted_depth = F.interpolate(
+            depth * valid, size=size, mode="bilinear", align_corners=False
+        )
+        support = F.interpolate(valid, size=size, mode="bilinear", align_corners=False)
+        resized_depth = weighted_depth / support.clamp_min(1e-6)
+        resized_valid = (support > 1e-3).to(dtype=depth.dtype)
+        return resized_depth * resized_valid, resized_valid
+
+    def _prepare_tof(self, tof_features: Tensor, size: tuple[int, int]) -> Tensor:
+        if tof_features.ndim == 3:
+            tof_features = tof_features.unsqueeze(1)
+        if tof_features.ndim != 4 or tof_features.shape[1] not in {1, 3}:
             raise ValueError(
-                f"image must have {self.image_channels} channels, got {image.shape[1]}"
+                "tof_features must have shape (B, 1, H, W), (B, 3, H, W), "
+                f"or (B, H, W); got {tuple(tof_features.shape)}"
             )
-        if sparse_depth.ndim == 3:
-            sparse_depth = sparse_depth.unsqueeze(1)
-        if sparse_depth.ndim != 4 or sparse_depth.shape[1] != 1:
+
+        if tof_features.shape[1] == 1:
+            mean = tof_features
+            valid = (torch.isfinite(mean) & (mean > 0)).to(dtype=mean.dtype)
+            mean = torch.nan_to_num(mean)
+            mean, valid = self._normalized_resize(mean, valid, size)
+            uncertainty = torch.zeros_like(mean)
+        else:
+            mean, uncertainty, valid = tof_features.split(1, dim=1)
+            mean = torch.nan_to_num(mean)
+            uncertainty = torch.nan_to_num(uncertainty).clamp_min(0)
+            valid = torch.nan_to_num(valid).clamp(0, 1)
+            if mean.shape[-2:] != size:
+                mean, valid = self._normalized_resize(mean, valid, size)
+                uncertainty = F.interpolate(
+                    uncertainty, size=size, mode="nearest"
+                ) * valid
+            else:
+                mean = mean * valid
+                uncertainty = uncertainty * valid
+        return torch.cat((mean, uncertainty, valid), dim=1)
+
+    def _validate_inputs(
+        self,
+        image: Tensor,
+        tof_features: Tensor,
+        tof_tokens: Tensor | None,
+    ) -> tuple[Tensor, Tensor | None]:
+        if image.ndim != 4 or image.shape[1] != self.image_channels:
             raise ValueError(
-                "sparse_depth must have shape (B, 1, Hd, Wd) or (B, Hd, Wd), "
-                f"got {tuple(sparse_depth.shape)}"
+                f"image must have shape (B, {self.image_channels}, H, W); "
+                f"got {tuple(image.shape)}"
             )
-        if image.shape[0] != sparse_depth.shape[0]:
-            raise ValueError("image and sparse_depth batch sizes must match")
-        if image.shape[-2] < 8 or image.shape[-1] < 8:
-            raise ValueError("image height and width must both be at least 8")
-        if not image.is_floating_point() or not sparse_depth.is_floating_point():
-            raise TypeError("image and sparse_depth must be floating-point tensors")
-        if image.device != sparse_depth.device:
-            raise ValueError("image and sparse_depth must be on the same device")
-        if image.dtype != sparse_depth.dtype:
-            sparse_depth = sparse_depth.to(dtype=image.dtype)
-        return sparse_depth
+        if image.shape[-2] < 16 or image.shape[-1] < 16:
+            raise ValueError("image height and width must both be at least 16")
+        if not image.is_floating_point() or not tof_features.is_floating_point():
+            raise TypeError("image and tof_features must be floating-point tensors")
+        if image.shape[0] != tof_features.shape[0]:
+            raise ValueError("image and tof_features batch sizes must match")
+        if image.device != tof_features.device:
+            raise ValueError("image and tof_features must be on the same device")
+        if tof_tokens is not None:
+            if tof_tokens.ndim != 3 or tof_tokens.shape[1:] != (64, 7):
+                raise ValueError(
+                    "tof_tokens must have shape (B, 64, 7); "
+                    f"got {tuple(tof_tokens.shape)}"
+                )
+            if not tof_tokens.is_floating_point():
+                raise TypeError("tof_tokens must be a floating-point tensor")
+            if image.shape[0] != tof_tokens.shape[0]:
+                raise ValueError("image and tof_tokens batch sizes must match")
+            if image.device != tof_tokens.device:
+                raise ValueError("image and tof_tokens must be on the same device")
+            tof_tokens = tof_tokens.to(dtype=image.dtype)
+        return tof_features.to(dtype=image.dtype), tof_tokens
 
-    def forward(self, image: Tensor, sparse_depth: Tensor) -> Tensor:
-        sparse_depth = self._validate_inputs(image, sparse_depth)
-        resized_depth = self._resize_depth(sparse_depth, image.shape[-2:])
-        encoder_attention = self.shared_qk(image, resized_depth)
+    @staticmethod
+    def _tokens_from_raster(tof: Tensor) -> Tensor:
+        """Build approximate 8x8 tokens for legacy two-input callers."""
 
-        x0_0 = self.fuse1(self.image_stem(image), encoder_attention)
-        x1_0 = self.fuse2(self.image_down1(x0_0), encoder_attention)
-        x2_0 = self.fuse3(self.image_down2(x1_0), encoder_attention)
-        x3_0 = self.fuse4(self.image_down3(x2_0), encoder_attention)
+        mean, uncertainty, valid = tof.split(1, dim=1)
+        support = F.adaptive_avg_pool2d(valid, (8, 8))
+        token_valid = support > 1e-3
+        token_mean = F.adaptive_avg_pool2d(mean * valid, (8, 8))
+        token_mean = token_mean / support.clamp_min(1e-6)
+        token_uncertainty = F.adaptive_avg_pool2d(uncertainty * valid, (8, 8))
+        token_uncertainty = token_uncertainty / support.clamp_min(1e-6)
 
-        decoder_attention = (
-            self.decoder_shared_qk(image, resized_depth)
-            if self.decoder_shared_qk is not None
-            else None
+        coordinate = (
+            torch.arange(8, device=tof.device, dtype=tof.dtype) + 0.5
+        ) / 8.0
+        center_y, center_x = torch.meshgrid(coordinate, coordinate, indexing="ij")
+        token_height = torch.full_like(center_y, 1.0 / 8.0)
+        token_width = torch.full_like(center_x, 1.0 / 8.0)
+        geometry = torch.stack(
+            (center_y, center_x, token_height, token_width), dim=0
         )
-        center_attention = (
-            (encoder_attention, decoder_attention)
-            if decoder_attention is not None
-            else encoder_attention
+        geometry = geometry.unsqueeze(0).expand(tof.shape[0], -1, -1, -1)
+
+        token_grid = torch.cat(
+            (
+                token_mean,
+                token_uncertainty,
+                token_valid.to(dtype=tof.dtype),
+                geometry,
+            ),
+            dim=1,
         )
+        return token_grid.flatten(2).transpose(1, 2)
 
-        x2_1 = self.up2_1(x3_0, x2_0, encoder_attention)
-        x1_1 = self.up1_1(x2_0, x1_0, encoder_attention)
-        x0_1 = self.up0_1(x1_0, x0_0, encoder_attention)
-        x1_2 = self.up1_2(x2_1, (x1_0, x1_1), center_attention)
-        x0_2 = self.up0_2(x1_1, (x0_0, x0_1), center_attention)
-        x0_3 = self.up0_3(x1_2, (x0_0, x0_1, x0_2), decoder_attention)
-        prediction = self.output_head(x0_3)
+    def forward(
+        self,
+        image: Tensor,
+        tof_features: Tensor,
+        tof_tokens: Tensor | None = None,
+    ) -> Tensor:
+        tof_features, tof_tokens = self._validate_inputs(
+            image, tof_features, tof_tokens
+        )
+        tof = self._prepare_tof(tof_features, image.shape[-2:])
+        mean, _, valid = tof.split(1, dim=1)
+        valid_count = valid.sum(dim=(-2, -1), keepdim=True).clamp_min(1.0)
+        global_mean = (mean * valid).sum(dim=(-2, -1), keepdim=True) / valid_count
+        if tof_tokens is None:
+            tof_tokens = self._tokens_from_raster(tof)
+        x1 = self.encoder1(self.stem(image))
+        x2 = self.encoder2(self.down2(x1))
+        x3 = self.encoder3(self.down3(x2))
+        x4 = self.down4(x3)
+        x4 = self.bottleneck(self.tof_conditioner(x4, tof_tokens))
+        decoded = self.decoder3(x4, x3)
+        decoded = self.decoder2(decoded, x2)
+        decoded = self.decoder1(decoded, x1)
+        decoded = F.interpolate(
+            decoded, size=image.shape[-2:], mode="bilinear", align_corners=False
+        )
+        decoded = self.full_refine(torch.cat((decoded, image), dim=1))
 
-        if self.residual_output:
-            prediction = prediction + resized_depth
+        # The sensor supplies only a global scale anchor at the output. Local
+        # piecewise-constant ToF rectangles never enter this full-resolution
+        # path, so their boundaries cannot be copied into the prediction.
+        learned_depth = self.depth_head(decoded) + global_mean
         if self.positive_output:
-            prediction = F.softplus(prediction)
-        return prediction
+            learned_depth = F.softplus(learned_depth)
+        return learned_depth
 
 
-# Friendly names for callers that prefer "Model" or "Net" terminology.
 DepthRefinementModel = DepthRefinementUNet
 DepthRefineNet = DepthRefinementUNet
