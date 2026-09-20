@@ -176,10 +176,17 @@ def evaluate(
             tof_features = batch.get("tof_features", batch["sparse_depth"]).to(
                 device, non_blocking=True
             )
+            tof_tokens = batch.get("tof_tokens")
+            if tof_tokens is not None:
+                tof_tokens = tof_tokens.to(device, non_blocking=True)
             target = batch["target_depth"].to(device, non_blocking=True)
             valid_mask = batch["target_valid_mask"].to(device, non_blocking=True).bool()
 
-            prediction = model(image, tof_features)
+            prediction = (
+                model(image, tof_features)
+                if tof_tokens is None
+                else model(image, tof_features, tof_tokens)
+            )
             if prediction_callback is not None:
                 prediction_callback(batch, prediction, batch_index)
             if loss_config is not None:
@@ -514,6 +521,9 @@ def train_model(
             tof_features = batch.get("tof_features", batch["sparse_depth"]).to(
                 device, non_blocking=True
             )
+            tof_tokens = batch.get("tof_tokens")
+            if tof_tokens is not None:
+                tof_tokens = tof_tokens.to(device, non_blocking=True)
             target = batch["target_depth"].to(device, non_blocking=True)
             valid_mask = batch["target_valid_mask"].to(device, non_blocking=True)
 
@@ -523,7 +533,11 @@ def train_model(
                 dtype=torch.float16,
                 enabled=use_amp,
             ):
-                prediction = model(image, tof_features)
+                prediction = (
+                    model(image, tof_features)
+                    if tof_tokens is None
+                    else model(image, tof_features, tof_tokens)
+                )
                 loss = masked_depth_loss(
                     prediction,
                     target,

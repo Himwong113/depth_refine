@@ -7,27 +7,28 @@ entire camera image.
 
 ## Model
 
-Each valid ToF zone is rasterized into its calibrated RGB rectangle. Three
-sensor channels are retained:
+Each valid ToF zone is retained as one compact conditioning token containing:
 
-- mean depth;
-- distribution standard deviation;
-- validity.
+- metric mean depth and distribution standard deviation;
+- validity;
+- normalized calibrated rectangle center and size.
 
 The model also derives the global mean of valid sensor depths as a scene-scale
 anchor. A four-level RGB encoder runs at 1/2 through 1/16 resolution. Local ToF
-features enter only through a learned gate at the 1/16 bottleneck. A single
-decoder uses additive RGB skip connections, and the full-resolution head sees
-RGB features rather than the rectangular ToF raster. This prevents calibrated
-zone boundaries from being copied into the prediction.
+features enter once through two-head, 16-dimensional cross-attention at the
+1/16 bottleneck. RGB features query the 64 ToF tokens, while a smooth geometric
+bias favors rectangles near each query without forbidding global context. A
+single decoder uses additive RGB skip connections, and the full-resolution head
+never receives the rectangular ToF raster. This prevents calibrated zone
+boundaries from being copied directly into the prediction.
 
 ![Lightweight calibrated-ToF architecture](docs/depth_refinement_architecture.png)
 
 Regenerate the PNG and editable SVG with `python draw_architecture.py`.
 
-    RGB → separable encoder (1/2–1/16) ─┐
-                                        ├→ coarse learned ToF gate
-    ToF mean / std / valid / scale ─────┘
+    RGB → separable encoder (1/2–1/16) ─┐ queries
+                                        ├→ geometric cross-attention
+    64 ToF mean/std/valid/box tokens ───┘ keys + values
                                                   │
                                     additive RGB-skip decoder
                                                   │
@@ -35,15 +36,17 @@ Regenerate the PNG and editable SVG with `python draw_architecture.py`.
                                                   │
                                          dense metric depth
 
-With the default width of 32, the model has **155,010 parameters** and
-approximately **1.43G convolution MACs** at 640×480. The previous nested model
-had 2.58M parameters and approximately 116G convolution MACs by the same
-counting method.
+With the default width of 32, the model has **125,925 parameters** and
+approximately **1.40G convolution/attention MACs** at 640×480. The replaced
+coarse gate used 33,664 parameters by itself; the cross-attention conditioner
+uses only 4,579. The previous nested model had 2.58M parameters and
+approximately 116G convolution MACs by the same counting method.
 
 Legacy callers may still pass a one-channel low-resolution depth tensor to the
 model. The model then uses validity-normalized interpolation, preventing zero
 invalid zones from diluting nearby measurements. Training uses the calibrated
-three-channel representation.
+64-zone tokens; the three-channel raster remains available for the global scale
+anchor and visualization.
 
 ## Setup
 
@@ -64,6 +67,7 @@ The expected training tensors are:
 | sparse_depth | B×1×8×8 | raw ToF mean for display/compatibility |
 | sparse_valid_mask | B×1×8×8 | raw zone validity |
 | tof_features | B×3×480×640 | calibrated mean/std/validity |
+| tof_tokens | B×64×7 | mean/std/validity plus normalized rectangle geometry |
 | target_depth | B×1×480×640 | metric ground truth |
 | target_valid_mask | B×1×480×640 | valid ground-truth pixels |
 
@@ -88,14 +92,14 @@ use metric RMSE. Start a new lightweight run with:
 
     python train.py
 
-Checkpoints are written to checkpoints_lite_v2/ and TensorBoard events to
-runs/depth_refinement_lite_v2/. These checkpoints are intentionally separate:
-the coarse-fusion architecture is incompatible with checkpoints from the former
-direct-blending model.
+Checkpoints are written to checkpoints_attention_v3/ and TensorBoard events to
+runs/depth_refinement_attention_v3/. These checkpoints are intentionally
+separate because the conditional-attention architecture is incompatible with
+the earlier coarse-fusion and direct-blending models.
 
 TensorBoard:
 
-    tensorboard --logdir runs/depth_refinement_lite_v2
+    tensorboard --logdir runs/depth_refinement_attention_v3
 
 Training records total validation RMSE and RMSE for 0–2 m, 2–4 m, 4–6 m, and
 6+ m. The far-depth curve is useful because a small number of distant pixels can
@@ -106,17 +110,17 @@ max_train_batches and max_validation_batches to 1 in config.yml.
 
 Resume a lightweight checkpoint by setting a larger total epoch count:
 
-    python train.py --resume checkpoints_lite_v2/depth_refinement_epoch_005.pt --epochs 60
+    python train.py --resume checkpoints_attention_v3/depth_refinement_epoch_005.pt --epochs 60
 
 ## Evaluation
 
 Evaluate the best checkpoint on the held-out test scenes:
 
-    python eval.py --checkpoint checkpoints_lite_v2/best.pt
+    python eval.py --checkpoint checkpoints_attention_v3/best.pt
 
 The evaluator reports masked MAE, total RMSE, and the four depth-bin RMSE
 values. Save RGB, calibrated ToF, prediction, and ground-truth panels with:
 
-    python eval.py --checkpoint checkpoints_lite_v2/best.pt --visualize
+    python eval.py --checkpoint checkpoints_attention_v3/best.pt --visualize
 
 All model, data, training, and evaluation settings are in config.yml.

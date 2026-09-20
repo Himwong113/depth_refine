@@ -58,6 +58,55 @@ def rasterize_calibrated_tof(
     return torch.from_numpy(features)
 
 
+def build_calibrated_tof_tokens(
+    hist_data: np.ndarray,
+    rect_data: np.ndarray,
+    sparse_mask: np.ndarray,
+    image_size: tuple[int, int],
+) -> Tensor:
+    """Encode 64 ToF zones as metric observations plus normalized geometry."""
+
+    if hist_data.shape != (64, 2):
+        raise ValueError(f"expected hist_data shape (64, 2), got {hist_data.shape}")
+    if rect_data.shape != (64, 4):
+        raise ValueError(f"expected fr shape (64, 4), got {rect_data.shape}")
+    if sparse_mask.shape != (64,):
+        raise ValueError(f"expected mask shape (64,), got {sparse_mask.shape}")
+
+    height, width = image_size
+    if height <= 0 or width <= 0:
+        raise ValueError("image height and width must be positive")
+
+    tokens = np.zeros((64, 7), dtype=np.float32)
+    top = np.clip(rect_data[:, 0], 0, height).astype(np.float32)
+    left = np.clip(rect_data[:, 1], 0, width).astype(np.float32)
+    bottom = np.clip(rect_data[:, 2], 0, height).astype(np.float32)
+    right = np.clip(rect_data[:, 3], 0, width).astype(np.float32)
+
+    rect_height = bottom - top
+    rect_width = right - left
+    mean = hist_data[:, 0]
+    standard_deviation = hist_data[:, 1]
+    valid = (
+        sparse_mask
+        & np.isfinite(mean)
+        & (mean > 0)
+        & np.isfinite(standard_deviation)
+        & (standard_deviation >= 0)
+        & (rect_height > 0)
+        & (rect_width > 0)
+    )
+
+    tokens[:, 0] = np.where(valid, mean, 0.0)
+    tokens[:, 1] = np.where(valid, standard_deviation, 0.0)
+    tokens[:, 2] = valid.astype(np.float32)
+    tokens[:, 3] = (top + bottom) * (0.5 / height)
+    tokens[:, 4] = (left + right) * (0.5 / width)
+    tokens[:, 5] = rect_height / height
+    tokens[:, 6] = rect_width / width
+    return torch.from_numpy(tokens)
+
+
 class ZJUL5Dataset(Dataset[dict[str, Any]]):
     """Load paired RGB, 8x8 ToF depth, and 480x640 target depth.
 
@@ -68,6 +117,7 @@ class ZJUL5Dataset(Dataset[dict[str, Any]]):
         ``image``: normalized ``float32`` tensor shaped ``(3, 480, 640)``.
         ``sparse_depth``: raw ToF mean depth shaped ``(1, 8, 8)``.
         ``tof_features``: calibrated mean/std/validity shaped ``(3, H, W)``.
+        ``tof_tokens``: 64 mean/std/validity/rectangle tokens shaped ``(64, 7)``.
         ``target_depth``: high-resolution depth shaped ``(1, 480, 640)``, with
         valid values clamped to the configured metric range.
         ``target_valid_mask``: valid target pixels shaped ``(1, 480, 640)``.
@@ -209,6 +259,12 @@ class ZJUL5Dataset(Dataset[dict[str, Any]]):
             sparse_mask,
             rgb.shape[:2],
         )
+        tof_tokens = build_calibrated_tof_tokens(
+            hist_data,
+            rect_data,
+            sparse_mask,
+            rgb.shape[:2],
+        )
 
         target_valid_mask_array = np.isfinite(target_depth) & (target_depth > 0)
         target_depth = np.where(
@@ -238,6 +294,7 @@ class ZJUL5Dataset(Dataset[dict[str, Any]]):
             target_valid_mask = target_valid_mask.flip(-1)
             sparse_depth = sparse_depth.flip(-1)
             sparse_valid_mask = sparse_valid_mask.flip(-1)
+            tof_tokens[:, 4] = 1.0 - tof_tokens[:, 4]
         if self.normalize_image:
             image = (image - self.image_mean) / self.image_std
 
@@ -245,6 +302,7 @@ class ZJUL5Dataset(Dataset[dict[str, Any]]):
             "image": image,
             "sparse_depth": sparse_depth,
             "tof_features": tof_features,
+            "tof_tokens": tof_tokens,
             "target_depth": target_depth_tensor,
             "target_valid_mask": target_valid_mask,
             "sparse_valid_mask": sparse_valid_mask,

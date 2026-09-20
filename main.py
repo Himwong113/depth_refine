@@ -111,6 +111,8 @@ def print_batch_summary(data_loader: Any) -> None:
     print(f"Sparse depth batch:       {tuple(batch['sparse_depth'].shape)}")
     if "tof_features" in batch:
         print(f"Calibrated ToF features:  {tuple(batch['tof_features'].shape)}")
+    if "tof_tokens" in batch:
+        print(f"Calibrated ToF tokens:    {tuple(batch['tof_tokens'].shape)}")
     print(f"High-resolution depth:    {tuple(batch['target_depth'].shape)}")
     print(f"High-resolution validity: {tuple(batch['target_valid_mask'].shape)}")
     print(f"Sparse validity:          {tuple(batch['sparse_valid_mask'].shape)}")

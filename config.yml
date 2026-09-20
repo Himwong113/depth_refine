@@ -7,6 +7,9 @@ model:
   # Used to normalize metric ToF features before they enter the network.
   depth_scale: 10.0
   positive_output: true
+  # Two 8-dimensional heads condition the 1/16 RGB bottleneck on 64 ToF zones.
+  attention_dim: 16
+  attention_heads: 2
 
 summary:
   # Controls the dtype used when calculating parameter/model memory.
@@ -79,7 +82,7 @@ training:
 
   tensorboard:
     enabled: true
-    log_dir: runs/depth_refinement_lite_v2
+    log_dir: runs/depth_refinement_attention_v3
     # Log eval-style RGB | sparse | refined | GT panels every N epochs.
     image_every: 1
     num_images: 2
@@ -87,8 +90,8 @@ training:
     # null uses the valid GT 99th percentile independently for each sample.
     depth_max: null
 
-  # Keep these incompatible lightweight checkpoints separate from legacy runs.
-  checkpoint_dir: checkpoints_lite_v2
+  # Keep attention checkpoints separate from incompatible coarse-fusion runs.
+  checkpoint_dir: checkpoints_attention_v3
   save_every: 5
 
   # Set either value to a small integer for a quick pipeline smoke test.

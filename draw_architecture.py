@@ -124,7 +124,8 @@ def render() -> None:
     axis.text(
         0.5,
         7.18,
-        "155.0K parameters • 1.43G convolution MACs at 640×480 • coarse gated ToF fusion",
+        "125.9K parameters • ~1.40G convolution/attention MACs at 640×480 "
+        "• geometric cross-attention",
         fontsize=9,
         color=MUTED,
     )
@@ -147,8 +148,8 @@ def render() -> None:
         3.65,
         2.2,
         1.25,
-        "Calibrated raster",
-        "mean / std / validity\n3 × H × W",
+        "ToF tokens",
+        "mean/std/valid/box\n64 × 7",
         TOF,
         TOF_EDGE,
     )
@@ -178,14 +179,14 @@ def render() -> None:
         ENC,
         ENC_EDGE,
     )
-    tof_gate = box(
+    tof_attention = box(
         axis,
         16.2,
         5.0,
         1.35,
         1.05,
-        "ToF gate",
-        "coarse fusion\n+ context",
+        "Cross-attn",
+        "2 heads × 8D\nsoft geometry",
         TOF,
         TOF_EDGE,
     )
@@ -200,7 +201,7 @@ def render() -> None:
         2.1,
         1.15,
         "Full-res refine",
-        "separable convolution\nRGB/ToF shortcut",
+        "separable convolution\n+ RGB skip",
         DEC,
         DEC_EDGE,
     )
@@ -233,8 +234,8 @@ def render() -> None:
     arrow(axis, center_right(e1), center_left(e2), ENC_EDGE)
     arrow(axis, center_right(e2), center_left(e3), ENC_EDGE)
     arrow(axis, center_right(e3), center_left(e4), ENC_EDGE)
-    arrow(axis, center_right(e4), center_left(tof_gate), ENC_EDGE)
-    arrow(axis, center_bottom(tof_gate), center_top(d3), DEC_EDGE, curve=0.08)
+    arrow(axis, center_right(e4), center_left(tof_attention), ENC_EDGE)
+    arrow(axis, center_bottom(tof_attention), center_top(d3), DEC_EDGE, curve=0.08)
     arrow(axis, center_left(d3), center_right(d2), DEC_EDGE)
     arrow(axis, center_left(d2), center_right(d1), DEC_EDGE)
     arrow(axis, center_bottom(d1), center_top(refine), DEC_EDGE, curve=0.1)
@@ -244,14 +245,36 @@ def render() -> None:
     arrow(axis, center_bottom(e3), center_top(d3), ENC_EDGE, dashed=True)
     arrow(axis, center_bottom(e2), center_top(d2), ENC_EDGE, dashed=True)
     arrow(axis, center_bottom(e1), center_top(d1), ENC_EDGE, dashed=True)
-    arrow(axis, center_bottom(fusion), center_top(refine), RGB_EDGE, dashed=True, curve=0.18)
-    arrow(axis, center_right(raster), center_left(tof_gate), TOF_EDGE, dashed=True, curve=-0.18)
-    arrow(axis, center_bottom(raster), center_top(heads), TOF_EDGE, dashed=True, curve=-0.22)
+    arrow(
+        axis,
+        center_bottom(fusion),
+        center_top(refine),
+        RGB_EDGE,
+        dashed=True,
+        curve=0.18,
+    )
+    arrow(
+        axis,
+        center_right(raster),
+        center_left(tof_attention),
+        TOF_EDGE,
+        dashed=True,
+        curve=-0.18,
+    )
+    arrow(
+        axis,
+        center_bottom(raster),
+        center_top(heads),
+        TOF_EDGE,
+        dashed=True,
+        curve=-0.22,
+    )
 
     axis.text(
         9.1,
         0.45,
-        "Solid: feature flow   •   Dashed: RGB skips, coarse ToF context, and global scale only",
+        "Solid: feature flow   •   Dashed: RGB skips, ToF token conditioning, "
+        "and global scale only",
         ha="center",
         fontsize=8,
         color=MUTED,
