@@ -5,6 +5,26 @@ VL53L5-style ToF measurement. The input pipeline uses the per-frame calibrated
 ToF rectangles stored in ZJU-L5 instead of stretching the 8×8 grid over the
 entire camera image.
 
+## RGB/ToF alignment
+
+The dataset supplies the RGB alignment for every ToF zone. For zone `i`,
+`hist_data[i]` contains its mean depth and standard deviation, `mask[i]`
+contains its validity, and `fr[i] = [top, left, bottom, right]` gives its
+calibrated footprint directly in RGB pixel coordinates. The rectangle uses
+half-open indexing: `rgb[top:bottom, left:right]`.
+
+The pipeline clips each rectangle to the RGB frame and converts it to
+`[mean, std, valid, center_y, center_x, height, width]`. The four geometry
+values are normalized by the RGB height and width. At the 1/16 bottleneck,
+every RGB location queries all valid ToF tokens; a smooth distance-to-rectangle
+bias favors zones whose calibrated footprint is near that RGB location. The
+model therefore uses the supplied calibration rather than assuming that the
+64 zones form uniform blocks across the RGB image.
+
+See [RGB and calibrated-ToF alignment](docs/tof_rgb_alignment.md) for the
+coordinate equations, an example, augmentation rules, and implementation
+details.
+
 ## Model
 
 Each valid ToF zone is retained as one compact conditioning token containing:
