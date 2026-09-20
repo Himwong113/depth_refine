@@ -15,31 +15,28 @@ sensor channels are retained:
 - validity.
 
 The model also derives the global mean of valid sensor depths as a scene-scale
-anchor. RGB and ToF remain separate channels at the input. A four-level
-depthwise-separable encoder runs at 1/2 through 1/16 resolution, followed by a
-single decoder with additive skip connections. The full-resolution head
-predicts dense depth and a confidence map. At valid sensor locations, confidence
-controls the mixture between the calibrated ToF prior and learned depth.
+anchor. A four-level RGB encoder runs at 1/2 through 1/16 resolution. Local ToF
+features enter only through a learned gate at the 1/16 bottleneck. A single
+decoder uses additive RGB skip connections, and the full-resolution head sees
+RGB features rather than the rectangular ToF raster. This prevents calibrated
+zone boundaries from being copied into the prediction.
 
 ![Lightweight calibrated-ToF architecture](docs/depth_refinement_architecture.png)
 
 Regenerate the PNG and editable SVG with `python draw_architecture.py`.
 
-    RGB ─────────────────────────────┐
-    ToF mean / std / valid / scale ──┴─ fused input
-                                          │
-                             separable encoder (1/2–1/16)
-                                          │
-                             additive single-path decoder
-                                          │
-                              full-resolution refinement
-                                          │
-                          learned depth + confidence gate
-                                          │
-                                  dense metric depth
+    RGB → separable encoder (1/2–1/16) ─┐
+                                        ├→ coarse learned ToF gate
+    ToF mean / std / valid / scale ─────┘
+                                                  │
+                                    additive RGB-skip decoder
+                                                  │
+                                    full-resolution RGB refine
+                                                  │
+                                         dense metric depth
 
-With the default width of 32, the model has **122,703 parameters** and
-approximately **1.54G convolution MACs** at 640×480. The previous nested model
+With the default width of 32, the model has **155,010 parameters** and
+approximately **1.43G convolution MACs** at 640×480. The previous nested model
 had 2.58M parameters and approximately 116G convolution MACs by the same
 counting method.
 
@@ -91,14 +88,14 @@ use metric RMSE. Start a new lightweight run with:
 
     python train.py
 
-Checkpoints are written to checkpoints_lite/ and TensorBoard events to
-runs/depth_refinement_lite/. These checkpoints are intentionally separate:
-the lightweight architecture is incompatible with checkpoints from the former
-nested-attention model.
+Checkpoints are written to checkpoints_lite_v2/ and TensorBoard events to
+runs/depth_refinement_lite_v2/. These checkpoints are intentionally separate:
+the coarse-fusion architecture is incompatible with checkpoints from the former
+direct-blending model.
 
 TensorBoard:
 
-    tensorboard --logdir runs/depth_refinement_lite
+    tensorboard --logdir runs/depth_refinement_lite_v2
 
 Training records total validation RMSE and RMSE for 0–2 m, 2–4 m, 4–6 m, and
 6+ m. The far-depth curve is useful because a small number of distant pixels can
@@ -109,17 +106,17 @@ max_train_batches and max_validation_batches to 1 in config.yml.
 
 Resume a lightweight checkpoint by setting a larger total epoch count:
 
-    python train.py --resume checkpoints_lite/depth_refinement_epoch_005.pt --epochs 60
+    python train.py --resume checkpoints_lite_v2/depth_refinement_epoch_005.pt --epochs 60
 
 ## Evaluation
 
 Evaluate the best checkpoint on the held-out test scenes:
 
-    python eval.py --checkpoint checkpoints_lite/best.pt
+    python eval.py --checkpoint checkpoints_lite_v2/best.pt
 
 The evaluator reports masked MAE, total RMSE, and the four depth-bin RMSE
 values. Save RGB, calibrated ToF, prediction, and ground-truth panels with:
 
-    python eval.py --checkpoint checkpoints_lite/best.pt --visualize
+    python eval.py --checkpoint checkpoints_lite_v2/best.pt --visualize
 
 All model, data, training, and evaluation settings are in config.yml.

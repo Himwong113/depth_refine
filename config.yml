@@ -79,7 +79,7 @@ training:
 
   tensorboard:
     enabled: true
-    log_dir: runs/depth_refinement_lite
+    log_dir: runs/depth_refinement_lite_v2
     # Log eval-style RGB | sparse | refined | GT panels every N epochs.
     image_every: 1
     num_images: 2
@@ -88,7 +88,7 @@ training:
     depth_max: null
 
   # Keep these incompatible lightweight checkpoints separate from legacy runs.
-  checkpoint_dir: checkpoints_lite
+  checkpoint_dir: checkpoints_lite_v2
   save_every: 5
 
   # Set either value to a small integer for a quick pipeline smoke test.

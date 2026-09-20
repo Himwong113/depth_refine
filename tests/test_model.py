@@ -24,7 +24,25 @@ class DepthRefinementUNetTests(unittest.TestCase):
         output.square().mean().backward()
         self.assertIsNotNone(model.stem[0].weight.grad)
         self.assertIsNotNone(model.depth_head.weight.grad)
-        self.assertIsNotNone(model.confidence_head.weight.grad)
+        self.assertIsNotNone(model.tof_fusion.tof_projection[0].weight.grad)
+        self.assertIsNotNone(model.tof_fusion.gate[0].weight.grad)
+
+    def test_output_has_no_direct_rectangular_tof_blend(self) -> None:
+        model = DepthRefinementUNet(base_channels=8).eval()
+        image = torch.zeros(1, 3, 32, 48)
+        tof = torch.zeros(1, 3, 32, 48)
+        tof[:, 0, :, :24] = 1.0
+        tof[:, 0, :, 24:] = 3.0
+        tof[:, 2] = 1.0
+
+        with torch.inference_mode():
+            output = model(image, tof)
+
+        # The zero-initialized residual head starts from one global scale value;
+        # it must not copy the 1 m / 3 m ToF zone boundary into the output.
+        left = output[..., :24].mean()
+        right = output[..., 24:].mean()
+        torch.testing.assert_close(left, right)
 
     def test_legacy_low_resolution_depth_remains_supported(self) -> None:
         model = DepthRefinementUNet(base_channels=8)
