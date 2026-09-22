@@ -244,11 +244,22 @@ def evaluate(
     max_batches: int | None = None,
     prediction_callback: Callable[[dict[str, Any], Tensor, int], None] | None = None,
     loss_config: dict[str, Any] | None = None,
+    teacher_model: nn.Module | None = None,
+    teacher_student_callback: Callable[
+        [dict[str, Any], Tensor, Tensor, int], None
+    ]
+    | None = None,
 ) -> dict[str, float]:
-    """Evaluate corrected pooled, image-averaged, and coverage-aware metrics."""
+    """Evaluate depth metrics, optionally comparing a teacher on the same batches."""
+
+    if teacher_student_callback is not None and teacher_model is None:
+        raise ValueError("teacher_student_callback requires teacher_model")
 
     model.eval()
+    if teacher_model is not None:
+        teacher_model.eval()
     overall_totals = _empty_depth_metric_totals()
+    teacher_totals = _empty_depth_metric_totals()
     image_metrics = {
         metric: [] for metric in ("mae", "rmse", "abs_rel", "delta1")
     }
@@ -282,8 +293,27 @@ def evaluate(
             )
             if not isinstance(prediction, Tensor):
                 prediction = prediction.depth
+            teacher_prediction = None
+            if teacher_model is not None:
+                teacher_prediction = forward_depth_model(
+                    teacher_model,
+                    image,
+                    tof_features,
+                    tof_tokens,
+                    return_aux=False,
+                )
+                if not isinstance(teacher_prediction, Tensor):
+                    teacher_prediction = teacher_prediction.depth
             if prediction_callback is not None:
                 prediction_callback(batch, prediction, batch_index)
+            if teacher_student_callback is not None:
+                assert teacher_prediction is not None
+                teacher_student_callback(
+                    batch,
+                    prediction,
+                    teacher_prediction,
+                    batch_index,
+                )
             if loss_config is not None:
                 loss_sum += masked_depth_loss(
                     prediction,
@@ -302,6 +332,18 @@ def evaluate(
                     "prediction contains non-finite values at valid target pixels"
                 )
             _accumulate_depth_metrics(overall_totals, prediction, target, valid_mask)
+            if teacher_prediction is not None:
+                if not torch.isfinite(teacher_prediction[valid_mask]).all():
+                    raise FloatingPointError(
+                        "teacher prediction contains non-finite values at valid "
+                        "target pixels"
+                    )
+                _accumulate_depth_metrics(
+                    teacher_totals,
+                    teacher_prediction,
+                    target,
+                    valid_mask,
+                )
             for sample_index in range(prediction.shape[0]):
                 sample_valid = valid_mask[sample_index]
                 if torch.any(sample_valid):
@@ -365,6 +407,11 @@ def evaluate(
     metrics = _finalize_depth_metrics(overall_totals)
     if not metrics:
         raise RuntimeError("validation produced no valid target-depth pixels")
+    if teacher_model is not None:
+        teacher_metrics = _finalize_depth_metrics(teacher_totals)
+        if not teacher_metrics:
+            raise RuntimeError("teacher evaluation produced no valid target-depth pixels")
+        metrics["teacher_rmse"] = teacher_metrics["rmse"]
     metrics.update(
         {
             f"image_{metric}": sum(values) / len(values)

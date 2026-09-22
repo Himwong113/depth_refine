@@ -101,6 +101,7 @@ evaluation:
   device: auto
   split: test
   max_batches: null
+  compare_teacher: true
   visualize: false
   visualization_dir: evaluation_outputs_student_v4
   num_visualizations: 8

@@ -48,6 +48,28 @@ def load_checkpoint(
     raise ValueError("checkpoint must contain a model state dictionary")
 
 
+def build_evaluation_teacher(
+    config: dict,
+    device: torch.device,
+) -> tuple[torch.nn.Module, Path, int | None]:
+    """Build the configured distillation teacher for paired evaluation."""
+
+    training_options = config.get("training", {})
+    distillation_options = training_options.get("distillation", {})
+    teacher_options = distillation_options.get("teacher_model")
+    checkpoint_value = distillation_options.get("teacher_checkpoint")
+    if not isinstance(teacher_options, dict) or checkpoint_value is None:
+        raise ValueError(
+            "teacher comparison requires training.distillation.teacher_model and "
+            "training.distillation.teacher_checkpoint"
+        )
+    teacher = build_model({"model": teacher_options}).to(device=device)
+    checkpoint_path = Path(checkpoint_value).expanduser()
+    epoch = load_checkpoint(teacher, checkpoint_path, device)
+    teacher.eval()
+    return teacher, checkpoint_path, epoch
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate a trained checkpoint.")
     parser.add_argument(
@@ -72,6 +94,12 @@ def main() -> None:
     )
     parser.add_argument("--visualization-dir", type=Path)
     parser.add_argument("--num-visualizations", type=int)
+    parser.add_argument(
+        "--compare-teacher",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="evaluate and visualize the configured teacher on the same samples",
+    )
     arguments = parser.parse_args()
 
     config = load_config(arguments.config)
@@ -82,6 +110,17 @@ def main() -> None:
     device = resolve_device(arguments.device or evaluation_options.get("device", "auto"))
     model = build_model(config).to(device=device)
     epoch = load_checkpoint(model, arguments.checkpoint, device)
+    compare_teacher = arguments.compare_teacher
+    if compare_teacher is None:
+        compare_teacher = bool(evaluation_options.get("compare_teacher", False))
+    teacher_model = None
+    teacher_checkpoint = None
+    teacher_epoch = None
+    if compare_teacher:
+        teacher_model, teacher_checkpoint, teacher_epoch = build_evaluation_teacher(
+            config,
+            device,
+        )
 
     data_options = dict(config["data"])
     data_options["split"] = arguments.split or evaluation_options.get("split", "test")
@@ -119,13 +158,26 @@ def main() -> None:
         data_loader,
         device,
         max_batches=max_batches,
-        prediction_callback=visualizer,
+        prediction_callback=visualizer if teacher_model is None else None,
+        teacher_model=teacher_model,
+        teacher_student_callback=(
+            visualizer.compare
+            if teacher_model is not None and visualizer is not None
+            else None
+        ),
     )
     print(f"Checkpoint: {arguments.checkpoint.resolve()}")
     if epoch is not None:
         print(f"Checkpoint epoch: {epoch}")
+    if teacher_checkpoint is not None:
+        print(f"Teacher checkpoint: {teacher_checkpoint.resolve()}")
+        if teacher_epoch is not None:
+            print(f"Teacher checkpoint epoch: {teacher_epoch}")
     print(f"Device: {device}")
     print(f"Split: {data_options['split']} ({len(data_loader.dataset):,} samples)")
+    if "teacher_rmse" in metrics:
+        print(f"Student pooled RMSE: {metrics['rmse']:.6f} m")
+        print(f"Teacher pooled RMSE: {metrics['teacher_rmse']:.6f} m")
     print("Region             RMSE (m)   MAE (m)    AbsRel      δ1")
     print("-----------------  ---------  ---------  ----------  ----------")
     metric_groups = (
