@@ -6,8 +6,10 @@ import warnings
 from collections.abc import Callable
 from itertools import chain
 from pathlib import Path
+import random
 from typing import Any
 
+import numpy as np
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
@@ -22,6 +24,7 @@ from distillation import (
     FeatureDistillationAdapters,
     distillation_ramp,
     student_distillation_loss,
+    student_distillation_loss_v5,
     student_ground_truth_loss,
     teacher_supervision_loss,
 )
@@ -241,11 +244,22 @@ def evaluate(
     max_batches: int | None = None,
     prediction_callback: Callable[[dict[str, Any], Tensor, int], None] | None = None,
     loss_config: dict[str, Any] | None = None,
+    teacher_model: nn.Module | None = None,
+    teacher_student_callback: Callable[
+        [dict[str, Any], Tensor, Tensor, int], None
+    ]
+    | None = None,
 ) -> dict[str, float]:
-    """Evaluate corrected pooled, image-averaged, and coverage-aware metrics."""
+    """Evaluate depth metrics, optionally comparing a teacher on the same batches."""
+
+    if teacher_student_callback is not None and teacher_model is None:
+        raise ValueError("teacher_student_callback requires teacher_model")
 
     model.eval()
+    if teacher_model is not None:
+        teacher_model.eval()
     overall_totals = _empty_depth_metric_totals()
+    teacher_totals = _empty_depth_metric_totals()
     image_metrics = {
         metric: [] for metric in ("mae", "rmse", "abs_rel", "delta1")
     }
@@ -279,8 +293,27 @@ def evaluate(
             )
             if not isinstance(prediction, Tensor):
                 prediction = prediction.depth
+            teacher_prediction = None
+            if teacher_model is not None:
+                teacher_prediction = forward_depth_model(
+                    teacher_model,
+                    image,
+                    tof_features,
+                    tof_tokens,
+                    return_aux=False,
+                )
+                if not isinstance(teacher_prediction, Tensor):
+                    teacher_prediction = teacher_prediction.depth
             if prediction_callback is not None:
                 prediction_callback(batch, prediction, batch_index)
+            if teacher_student_callback is not None:
+                assert teacher_prediction is not None
+                teacher_student_callback(
+                    batch,
+                    prediction,
+                    teacher_prediction,
+                    batch_index,
+                )
             if loss_config is not None:
                 loss_sum += masked_depth_loss(
                     prediction,
@@ -299,6 +332,18 @@ def evaluate(
                     "prediction contains non-finite values at valid target pixels"
                 )
             _accumulate_depth_metrics(overall_totals, prediction, target, valid_mask)
+            if teacher_prediction is not None:
+                if not torch.isfinite(teacher_prediction[valid_mask]).all():
+                    raise FloatingPointError(
+                        "teacher prediction contains non-finite values at valid "
+                        "target pixels"
+                    )
+                _accumulate_depth_metrics(
+                    teacher_totals,
+                    teacher_prediction,
+                    target,
+                    valid_mask,
+                )
             for sample_index in range(prediction.shape[0]):
                 sample_valid = valid_mask[sample_index]
                 if torch.any(sample_valid):
@@ -362,6 +407,11 @@ def evaluate(
     metrics = _finalize_depth_metrics(overall_totals)
     if not metrics:
         raise RuntimeError("validation produced no valid target-depth pixels")
+    if teacher_model is not None:
+        teacher_metrics = _finalize_depth_metrics(teacher_totals)
+        if not teacher_metrics:
+            raise RuntimeError("teacher evaluation produced no valid target-depth pixels")
+        metrics["teacher_rmse"] = teacher_metrics["rmse"]
     metrics.update(
         {
             f"image_{metric}": sum(values) / len(values)
@@ -473,6 +523,15 @@ def _checkpoint_state(
         "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
         "scaler_state_dict": scaler.state_dict(),
         "training_config": config,
+        "model_config": config.get("_resolved_model_config"),
+        "data_config": config.get("_resolved_data_config"),
+        "objective_version": str(config.get("objective", "legacy")),
+        "rng_state": {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch": torch.get_rng_state(),
+            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+        },
         "best_validation_rmse": best_validation_rmse,
         "best_epoch": best_epoch,
     }
@@ -501,6 +560,14 @@ def _load_resume_checkpoint(
         missing = ", ".join(sorted(missing_keys))
         raise ValueError(f"resume checkpoint is missing: {missing}")
 
+    checkpoint_architecture = checkpoint.get("architecture")
+    model_architecture = getattr(model, "architecture", "attention_v3")
+    if checkpoint_architecture not in {None, model_architecture}:
+        raise ValueError(
+            f"resume checkpoint architecture {checkpoint_architecture!r} does "
+            f"not match model {model_architecture!r}"
+        )
+
     initial_scheduler_lrs = [group["lr"] for group in optimizer.param_groups]
     model.load_state_dict(checkpoint["model_state_dict"], strict=True)
     if auxiliary_module is not None:
@@ -513,6 +580,16 @@ def _load_resume_checkpoint(
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     if "scaler_state_dict" in checkpoint:
         scaler.load_state_dict(checkpoint["scaler_state_dict"])
+    rng_state = checkpoint.get("rng_state")
+    if isinstance(rng_state, dict):
+        if "python" in rng_state:
+            random.setstate(rng_state["python"])
+        if "numpy" in rng_state:
+            np.random.set_state(rng_state["numpy"])
+        if "torch" in rng_state:
+            torch.set_rng_state(rng_state["torch"].cpu())
+        if torch.cuda.is_available() and rng_state.get("cuda"):
+            torch.cuda.set_rng_state_all(rng_state["cuda"])
 
     completed_epoch = int(checkpoint["epoch"])
     scheduler_state = checkpoint.get("scheduler_state_dict")
@@ -556,20 +633,32 @@ def train_model(
     device = resolve_device(str(config.get("device", "auto")))
     model.to(device=device)
     objective = str(config.get("objective", "legacy"))
-    if objective not in {"legacy", "teacher_v4", "student_distillation_v4"}:
+    supported_objectives = {
+        "legacy",
+        "teacher_v4",
+        "student_distillation_v4",
+        "student_supervised_v5",
+        "student_distillation_v5",
+    }
+    if objective not in supported_objectives:
         raise ValueError(
-            "training.objective must be legacy, teacher_v4, or "
-            "student_distillation_v4"
+            "unsupported training.objective; choose one of "
+            + ", ".join(sorted(supported_objectives))
         )
     distillation_config = dict(config.get("distillation", {}))
     adapters: FeatureDistillationAdapters | None = None
-    if objective == "student_distillation_v4":
+    if objective in {"student_distillation_v4", "student_distillation_v5"}:
         if teacher_model is None:
+            raise ValueError(f"{objective} requires a loaded teacher_model")
+        expected_architecture = (
+            "student_v4"
+            if objective == "student_distillation_v4"
+            else "student_v5"
+        )
+        if getattr(model, "architecture", None) != expected_architecture:
             raise ValueError(
-                "student_distillation_v4 requires a loaded teacher_model"
+                f"{objective} requires model.architecture={expected_architecture}"
             )
-        if getattr(model, "architecture", None) != "student_v4":
-            raise ValueError("student_distillation_v4 requires model.architecture=student_v4")
         teacher_model.to(device=device)
         teacher_model.eval()
         for parameter in teacher_model.parameters():
@@ -593,7 +682,13 @@ def train_model(
             teacher_channels=teacher_channels,
         ).to(device)
     elif teacher_model is not None:
-        raise ValueError("teacher_model is only valid for student_distillation_v4")
+        raise ValueError("teacher_model is only valid for student distillation")
+    if objective == "student_supervised_v5" and getattr(
+        model, "architecture", None
+    ) != "student_v5":
+        raise ValueError(
+            "student_supervised_v5 requires model.architecture=student_v5"
+        )
 
     trainable_parameters = [
         parameter
@@ -716,10 +811,6 @@ def train_model(
                         "Multiline",
                         ["Loss/train", "Loss/validation"],
                     ],
-                    "Overfitting gap": [
-                        "Multiline",
-                        ["Overfitting/validation_minus_train_loss"],
-                    ],
                 }
             }
         )
@@ -745,6 +836,7 @@ def train_model(
             teacher_model.eval()
         current_learning_rate = optimizer.param_groups[0]["lr"]
         epoch_loss = 0.0
+        epoch_components: dict[str, float] = {}
         completed_batches = 0
 
         for batch_index, batch in enumerate(train_loader, start=1):
@@ -762,6 +854,7 @@ def train_model(
             valid_mask = batch["target_valid_mask"].to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
+            components: dict[str, Tensor] = {}
             with torch.autocast(
                 device_type=device.type,
                 dtype=torch.float16,
@@ -775,15 +868,24 @@ def train_model(
                         tof_tokens,
                         return_aux=True,
                     )
-                    loss, _ = teacher_supervision_loss(
+                    loss, components = teacher_supervision_loss(
                         output,
                         target,
                         valid_mask,
                         metric_weight=float(config.get("metric_weight", 1.0)),
                         gradient_weight=float(config.get("gradient_weight", 0.1)),
                     )
-                elif objective == "student_distillation_v4":
-                    if tof_tokens is None or teacher_model is None or adapters is None:
+                elif objective in {
+                    "student_distillation_v4",
+                    "student_supervised_v5",
+                    "student_distillation_v5",
+                }:
+                    is_distillation = objective != "student_supervised_v5"
+                    if tof_tokens is None:
+                        raise RuntimeError("student training requires calibrated tokens")
+                    if is_distillation and (
+                        teacher_model is None or adapters is None
+                    ):
                         raise RuntimeError(
                             "distillation requires tokens, teacher, and adapters"
                         )
@@ -795,16 +897,9 @@ def train_model(
                         return_aux=True,
                     )
                     if not isinstance(student_output, DepthOutput):
-                        raise TypeError("student_v4 must return DepthOutput with return_aux")
-                    strength = distillation_ramp(
-                        epoch,
-                        ground_truth_epochs=int(
-                            distillation_config.get("ground_truth_epochs", 5)
-                        ),
-                        ramp_end_epoch=int(
-                            distillation_config.get("ramp_end_epoch", 10)
-                        ),
-                    )
+                        raise TypeError(
+                            "student models must return DepthOutput with return_aux"
+                        )
                     metric_weight = float(
                         distillation_config.get("metric_weight", 1.0)
                     )
@@ -817,8 +912,21 @@ def train_model(
                     inside_weight = float(
                         distillation_config.get("inside_coverage_weight", 1.0)
                     )
-                    if strength == 0.0:
-                        loss, _, _, _ = student_ground_truth_loss(
+                    strength = (
+                        distillation_ramp(
+                            epoch,
+                            ground_truth_epochs=int(
+                                distillation_config.get("ground_truth_epochs", 5)
+                            ),
+                            ramp_end_epoch=int(
+                                distillation_config.get("ramp_end_epoch", 10)
+                            ),
+                        )
+                        if is_distillation
+                        else 0.0
+                    )
+                    if not is_distillation or strength == 0.0:
+                        loss, components, _, _ = student_ground_truth_loss(
                             student_output.depth,
                             target,
                             valid_mask,
@@ -829,6 +937,8 @@ def train_model(
                             inside_coverage_weight=inside_weight,
                         )
                     else:
+                        assert teacher_model is not None
+                        assert adapters is not None
                         with torch.no_grad():
                             teacher_output = forward_depth_model(
                                 teacher_model,
@@ -841,7 +951,12 @@ def train_model(
                             raise TypeError(
                                 "teacher_v4 must return DepthOutput with return_aux"
                             )
-                        loss, _ = student_distillation_loss(
+                        distillation_loss = (
+                            student_distillation_loss
+                            if objective == "student_distillation_v4"
+                            else student_distillation_loss_v5
+                        )
+                        loss, components = distillation_loss(
                             student_output,
                             teacher_output,
                             target,
@@ -895,6 +1010,10 @@ def train_model(
             scaler.update()
 
             epoch_loss += loss.item()
+            for name, value in components.items():
+                epoch_components[name] = epoch_components.get(name, 0.0) + float(
+                    value.detach().float().item()
+                )
             completed_batches += 1
             if log_every > 0 and batch_index % log_every == 0:
                 print(
@@ -949,6 +1068,10 @@ def train_model(
         if writer is not None:
             writer.add_scalar("Loss/train", mean_loss, epoch)
             writer.add_scalar("Learning_rate/epoch", current_learning_rate, epoch)
+            for name, total in epoch_components.items():
+                writer.add_scalar(
+                    f"Loss_components/{name}", total / completed_batches, epoch
+                )
             if validation_metrics is not None:
                 writer.add_scalar("Loss/validation", validation_metrics["loss"], epoch)
                 writer.add_scalar(
@@ -962,17 +1085,6 @@ def train_model(
                         writer.add_scalar(
                             f"Metrics/depth_bins/{metric_name}", metric_value, epoch
                         )
-                writer.add_scalar(
-                    "Overfitting/validation_minus_train_loss",
-                    validation_metrics["loss"] - mean_loss,
-                    epoch,
-                )
-                if mean_loss > 0:
-                    writer.add_scalar(
-                        "Overfitting/validation_to_train_loss_ratio",
-                        validation_metrics["loss"] / mean_loss,
-                        epoch,
-                    )
             writer.flush()
 
         if scheduler is not None:

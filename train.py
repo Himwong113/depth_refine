@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import random
 import warnings
 
+import numpy as np
 import torch
 
 from data import build_zjul5_dataloader, get_zjul5_manifest_splits
@@ -22,7 +24,10 @@ from training import train_model
 def _build_distillation_teacher(training_options: dict) -> torch.nn.Module | None:
     """Build and strictly restore the frozen Stage-A teacher when requested."""
 
-    if training_options.get("objective", "legacy") != "student_distillation_v4":
+    if training_options.get("objective", "legacy") not in {
+        "student_distillation_v4",
+        "student_distillation_v5",
+    }:
         return None
     distillation_options = training_options.get("distillation", {})
     teacher_options = distillation_options.get("teacher_model")
@@ -68,6 +73,16 @@ def _resolve_validation_split(
     )
 
 
+def _seed_everything(seed: int) -> None:
+    """Seed model initialization, augmentation, and dataloader sampling."""
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train the depth-refinement model.")
     parser.add_argument(
@@ -92,6 +107,7 @@ def main() -> None:
     if "data" not in config or "training" not in config:
         raise ValueError("training requires 'data' and 'training' config sections")
 
+    _seed_everything(int(config["data"].get("seed", 0)))
     model = build_model(config)
     print_model_summary(
         model,
@@ -116,6 +132,14 @@ def main() -> None:
         requested_validation_split,
         available_splits,
     )
+    if using_test_fallback and config["training"].get("objective") in {
+        "student_supervised_v5",
+        "student_distillation_v5",
+    }:
+        raise ValueError(
+            "student_v5 research runs require a validation split and cannot "
+            "select checkpoints using the test split"
+        )
     validation_loader = None
     if validation_split is not None:
         if using_test_fallback:
@@ -133,6 +157,8 @@ def main() -> None:
         validation_loader = build_zjul5_dataloader(validation_data_options)
 
     training_options = dict(config["training"])
+    training_options["_resolved_model_config"] = dict(config["model"])
+    training_options["_resolved_data_config"] = dict(training_data_options)
     training_options["validation_split"] = validation_split
     training_options["validation_uses_test_fallback"] = using_test_fallback
     if arguments.resume is not None:

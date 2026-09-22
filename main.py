@@ -11,7 +11,12 @@ from torch import nn
 import yaml
 
 from data import build_zjul5_dataloader
-from model import DepthRefinementUNet, MobileDepthStudent, RGBToFTeacher
+from model import (
+    DepthRefinementUNet,
+    EfficientFormerDepthStudent,
+    MobileDepthStudent,
+    RGBToFTeacher,
+)
 
 
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent / "config.yml"
@@ -46,6 +51,7 @@ def build_model(config: dict[str, Any]) -> nn.Module:
     constructors: dict[str, type[nn.Module]] = {
         "attention_v3": DepthRefinementUNet,
         "student_v4": MobileDepthStudent,
+        "student_v5": EfficientFormerDepthStudent,
         "teacher_v4": RGBToFTeacher,
     }
     if architecture not in constructors:

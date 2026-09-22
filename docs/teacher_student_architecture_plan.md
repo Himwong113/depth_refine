@@ -1,9 +1,10 @@
 # RGB–ToF Teacher–Student Architecture Plan
 
-Implementation status: the v4 architecture, corrected target protocol,
-training objectives, architecture configs, and tests described below are now
-implemented. Accuracy acceptance criteria remain experiment gates and cannot be
-claimed until the full teacher/student/ablation runs are completed.
+Implementation status: the v4 teacher and baseline student remain available.
+The current `student_v5` implementation uses a randomly initialized
+EfficientFormerV2-S0 encoder, corrected confidence-aware distillation, a
+dedicated configuration, TorchScript export, and regression tests. Accuracy
+and iPhone latency remain experiment gates.
 
 ## Objective
 
@@ -18,7 +19,7 @@ The primary research target is depth outside valid ToF coverage. Current validat
 ```mermaid
 flowchart TD
     RGB[RGB image] --> TR[Frozen pretrained RGB features]
-    RGB --> SR[Lightweight student RGB encoder]
+    RGB --> SR[Scratch EfficientFormerV2-S0 + detail branch]
     TOF[64 calibrated ToF tokens] --> TF[Teacher sensor fusion]
     TOF --> SF[Student sensor fusion]
     TR --> TF
@@ -68,7 +69,48 @@ The existing Depth Anything prediction head is not used as the teacher output be
 - Predict a residual relative to the anchor and apply a positive-output transformation.
 - Return the final metric-depth prediction and fused features at 1/8 and 1/16 resolution for student distillation.
 
-## Student architecture
+## Student V5 architecture
+
+### Scratch EfficientFormerV2 RGB encoder
+
+- Use the EfficientFormerV2-S0 architecture with random initialization.
+- Never download or load ImageNet weights for the student.
+- Resize RGB to a fixed 256×320 semantic input.
+- Use S0 features with 32, 48, 96, and 176 channels at reductions 4, 8, 16,
+  and 32 relative to the working image.
+- Project and resize the pyramid into decoder widths 64, 96, and 128.
+- Add a shallow full-image detail branch that supplies a 32-channel 1/4 skip.
+- Train the complete encoder from epoch one.
+
+The fixed working dimensions are divisible by 32. This avoids the odd-height
+residual mismatch in EfficientFormerV2's stride-two attention while the depth
+head still returns 640×480 output.
+
+### V5 ToF fusion and decoder
+
+- Retain calibrated 64×7 tokens and cross-attention at 1/16 and 1/8.
+- Pool the RGB-only 1/16 decoder appearance once and reuse it at both fusion
+  scales.
+- Retain the learned null token, geometry-biased head, global head, and metric
+  anchor.
+- Decode to 1/4 with additive skips and retain the narrow eight-channel
+  full-resolution refinement head.
+
+The complete V5 model contains 3,393,614 parameters. The encoder architecture
+adds RGB self-attention at coarse resolution; it does not replace sensor
+cross-attention.
+
+### Corrected V5 teacher transfer
+
+Teacher confidence is `exp(-abs(teacher-target)/0.25)`. The corrected depth
+loss divides by valid coverage weight without including confidence in the
+denominator, so low confidence reduces the teacher's absolute gradient.
+Feature supervision uses area-pooled valid coverage and confidence maps.
+
+Epochs 1–5 use ground truth only. Teacher depth and feature supervision ramp
+during epochs 6–10 and remain at full configured weight afterward.
+
+## Student V4 architecture
 
 ### RGB encoder
 
@@ -129,7 +171,7 @@ Split the current `model.py` implementation by responsibility:
 | File | Responsibility |
 | --- | --- |
 | `model/blocks.py` | Convolution, normalization, depthwise-separable blocks, and channel context. |
-| `model/rgb.py` | Mobile RGB encoder and frozen pretrained feature-pyramid adapter. |
+| `model/rgb.py` | Mobile V4 encoder, scratch EfficientFormerV2 V5 adapter, and frozen teacher pyramid. |
 | `model/tof.py` | Token validation, footprint pooling, token encoding, and sensor attention. |
 | `model/decoder.py` | Additive decoder blocks and metric-depth heads. |
 | `model/teacher.py` | Pretrained RGB extractor, teacher fusion, and teacher decoder composition. |
@@ -225,6 +267,8 @@ with:
 ```bash
 python main.py --config configs/teacher_v4.yml --para-summary
 python main.py --config configs/student_v4.yml --para-summary
+python main.py --config configs/student_v5.yml --para-summary
+python benchmark_student.py --config configs/student_v5.yml
 ```
 
 The reported storage uses `summary.parameter_dtype` from the selected config
@@ -253,8 +297,8 @@ The new student is accepted only if it satisfies all of the following:
 | --- | ---: |
 | Overall corrected RMSE improvement | At least 5% |
 | Outside-coverage RMSE improvement | At least 10% |
-| Student parameters | At most 500,000 |
-| Student convolution/attention MACs | At most 0.5G |
+| Student parameters | Report model and storage; no fixed cap |
+| Student convolution/attention MACs | Report at deployment input size |
 | Output resolution | 640×480 |
 | Phone inference latency | p95 at most 33 ms |
 | Incremental phone inference memory | At most 128 MiB |

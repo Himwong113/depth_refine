@@ -68,6 +68,44 @@ class EvaluationMetricTests(unittest.TestCase):
         self.assertAlmostEqual(metrics["boundary_accuracy"], 1.0 / 3.0)
         self.assertAlmostEqual(metrics["boundary_rmse"], math.sqrt(0.5))
 
+    def test_teacher_uses_same_batch_and_reports_rmse(self) -> None:
+        target = torch.tensor([[[[1.0, 2.0]]]])
+        student_prediction = torch.tensor([[[[2.0, 2.0]]]])
+        teacher_prediction = target.clone()
+        tokens = torch.zeros(1, 64, 7)
+        batch = {
+            "image": torch.zeros(1, 3, 1, 2),
+            "sparse_depth": torch.zeros(1, 1, 1, 2),
+            "tof_tokens": tokens,
+            "target_depth": target,
+            "target_valid_mask": torch.ones_like(target, dtype=torch.bool),
+        }
+        compared: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+        def record_comparison(
+            callback_batch: dict,
+            student: torch.Tensor,
+            teacher: torch.Tensor,
+            batch_index: int,
+        ) -> None:
+            self.assertIs(callback_batch, batch)
+            self.assertEqual(batch_index, 0)
+            compared.append((student, teacher))
+
+        metrics = evaluate(
+            FixedPredictionModel(student_prediction),
+            [batch],
+            torch.device("cpu"),
+            teacher_model=FixedPredictionModel(teacher_prediction),
+            teacher_student_callback=record_comparison,
+        )
+
+        self.assertEqual(len(compared), 1)
+        self.assertTrue(torch.equal(compared[0][0], student_prediction))
+        self.assertTrue(torch.equal(compared[0][1], teacher_prediction))
+        self.assertAlmostEqual(metrics["rmse"], math.sqrt(0.5))
+        self.assertAlmostEqual(metrics["teacher_rmse"], 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

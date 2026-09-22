@@ -1,4 +1,4 @@
-"""Export a fixed-resolution student_v4 TorchScript deployment artifact."""
+"""Export a fixed-resolution v4 or v5 student TorchScript artifact."""
 
 from __future__ import annotations
 
@@ -16,8 +16,11 @@ def _load_student_checkpoint(model: torch.nn.Module, checkpoint_path: Path) -> N
     if not isinstance(checkpoint, dict):
         raise ValueError("checkpoint must be a state dictionary or training checkpoint")
     architecture = checkpoint.get("architecture")
-    if architecture not in {None, "student_v4"}:
-        raise ValueError(f"expected student_v4 checkpoint, got {architecture!r}")
+    expected_architecture = getattr(model, "architecture", None)
+    if architecture not in {None, expected_architecture}:
+        raise ValueError(
+            f"expected {expected_architecture} checkpoint, got {architecture!r}"
+        )
     state = checkpoint.get("model_state_dict", checkpoint)
     if not isinstance(state, dict):
         raise ValueError("checkpoint has no model state dictionary")
@@ -53,8 +56,8 @@ def main() -> None:
 
     config = load_config(arguments.config)
     model = build_model(config).cpu().eval()
-    if getattr(model, "architecture", None) != "student_v4":
-        raise ValueError("export requires model.architecture=student_v4")
+    if getattr(model, "architecture", None) not in {"student_v4", "student_v5"}:
+        raise ValueError("export requires a student_v4 or student_v5 architecture")
     _load_student_checkpoint(model, arguments.checkpoint)
     image = torch.randn(1, 3, arguments.height, arguments.width)
     tokens = _example_tokens()

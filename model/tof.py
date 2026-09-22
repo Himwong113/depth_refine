@@ -155,6 +155,7 @@ class FootprintAwareToFAttention(nn.Module):
         self.num_heads = num_heads
         self.geometry_heads = geometry_heads
         self.head_dim = attention_dim // num_heads
+        self.appearance_channels = int(appearance_channels)
         self.depth_scale = float(depth_scale)
         self.use_appearance_pooling = bool(use_appearance_pooling)
 
@@ -187,11 +188,23 @@ class FootprintAwareToFAttention(nn.Module):
         if tof_tokens.shape[0] != batch_size:
             raise ValueError("features and tof_tokens batch sizes must match")
         normalized, valid = normalize_tof_tokens(tof_tokens, self.depth_scale)
-        if self.use_appearance_pooling:
+        if self.use_appearance_pooling and appearance_features.ndim == 4:
             appearance = pool_token_appearance(appearance_features, normalized)
+        elif self.use_appearance_pooling and appearance_features.ndim == 3:
+            expected = (
+                batch_size,
+                tof_tokens.shape[1],
+                self.appearance_channels,
+            )
+            if tuple(appearance_features.shape) != expected:
+                raise ValueError(
+                    "pooled appearance must have shape "
+                    f"{expected}; got {tuple(appearance_features.shape)}"
+                )
+            appearance = appearance_features
         else:
             appearance = appearance_features.new_zeros(
-                batch_size, tof_tokens.shape[1], appearance_features.shape[1]
+                batch_size, tof_tokens.shape[1], self.appearance_channels
             )
 
         queries = self.query_projection(self.feature_norm(features))
